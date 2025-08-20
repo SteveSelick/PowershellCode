@@ -3,9 +3,19 @@
 # This automates the manual diskpart and bcdboot steps
 
 param(
-    [switch]$AutoReboot,  # Manual reboot by default, use -AutoReboot to enable
+    [switch]$NoReboot,  # Manual reboot by default when run standalone, use -NoReboot to prevent
     [int]$MinDiskSizeGB = 500  # Minimum disk size to identify as ASR disk (default 500GB)
 )
+
+# Check if script is being run via automation (Invoke-AzVMRunCommand)
+$isAutomated = $env:USERNAME -eq 'SYSTEM' -or $env:COMPUTERNAME -match 'proxy'
+
+# If automated, always reboot unless explicitly prevented
+if ($isAutomated -and !$NoReboot) {
+    $AutoReboot = $true
+} else {
+    $AutoReboot = $false
+}
 
 $ErrorActionPreference = "Stop"
 
@@ -212,8 +222,9 @@ Write-Host "Windows Partition: Partition $winPartNum (${winLetter}:)" -Foregroun
 Write-Host "Boot Configuration: UEFI with ASR as default" -ForegroundColor White
 Write-Host "Boot Entries: $entryCount Windows Boot Manager entries" -ForegroundColor White
 
-if ($AutoReboot) {
-    Write-Host "`nRebooting in 10 seconds..." -ForegroundColor Yellow
+if ($AutoReboot -or ($isAutomated -and !$NoReboot)) {
+    Write-Host "`nAUTOMATIC REBOOT IN 10 SECONDS..." -ForegroundColor Yellow
+    Write-Host "System will boot into ASR Windows after restart." -ForegroundColor Green
     Write-Host "Press Ctrl+C to cancel reboot" -ForegroundColor Gray
     Start-Sleep -Seconds 10
     Restart-Computer -Force
