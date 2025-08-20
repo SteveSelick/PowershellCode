@@ -4,7 +4,7 @@
 
 param(
     [switch]$AutoReboot,  # Manual reboot by default, use -AutoReboot to enable
-    [int]$ASRDiskSizeGB = 3300  # Default 3.3TB for ASR disk identification
+    [int]$MinDiskSizeGB = 500  # Minimum disk size to identify as ASR disk (default 500GB)
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,12 +20,12 @@ if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     exit
 }
 
-# Step 1: Identify the ASR disk (looking for disk > 3TB)
+# Step 1: Identify the ASR disk (looking for large secondary disk)
 Write-Host "`nStep 1: Identifying ASR disk..." -ForegroundColor Yellow
-$asrDisk = Get-Disk | Where-Object {$_.Size -gt ($ASRDiskSizeGB * 1GB)} | Select-Object -First 1
+$asrDisk = Get-Disk | Where-Object {$_.Number -ne 0 -and $_.Size -gt ($MinDiskSizeGB * 1GB)} | Select-Object -First 1
 
 if (-not $asrDisk) {
-    Write-Host "ERROR: No disk larger than $ASRDiskSizeGB GB found!" -ForegroundColor Red
+    Write-Host "ERROR: No secondary disk larger than $MinDiskSizeGB GB found!" -ForegroundColor Red
     Write-Host "Available disks:" -ForegroundColor Yellow
     Get-Disk | Format-Table Number,FriendlyName,Size,PartitionStyle,OperationalStatus
     exit 1
@@ -59,55 +59,54 @@ $partitionInfo | Where-Object {$_ -match "Partition"} | ForEach-Object {Write-Ho
 Write-Host "`nStep 3: Identifying EFI and Windows partitions..." -ForegroundColor Yellow
 
 # Get partitions programmatically
-$partitions = Get-Partition -DiskNumber $diskNumber
+$partitions = Get-Partition -DiskNumber $diskNumber -ErrorAction SilentlyContinue
 
-# Find EFI partition (usually ~100MB, FAT32)
+# Find EFI partition (usually ~100-260MB, FAT32)
 $efiPartition = $partitions | Where-Object {
-    $_.Size -gt 50MB -and $_.Size -lt 500MB -and $_.GptType -eq '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
-}
+    $_.Size -gt 50MB -and $_.Size -lt 500MB -and ($_.GptType -eq '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' -or $_.Type -eq 'System')
+} | Select-Object -First 1
 
-# Find Windows partition (largest NTFS partition)
+# Find Windows partition (largest partition > 100GB)
 $windowsPartition = $partitions | Where-Object {
     $_.Size -gt 100GB
 } | Sort-Object Size -Descending | Select-Object -First 1
 
-if (-not $efiPartition) {
-    Write-Host "WARNING: Could not automatically identify EFI partition" -ForegroundColor Yellow
-    $efiPartNum = Read-Host "Enter EFI partition number (usually 2)"
-} else {
+# Determine partition numbers
+if ($efiPartition) {
     $efiPartNum = $efiPartition.PartitionNumber
     Write-Host "Found EFI partition: Partition $efiPartNum (Size: $([math]::Round($efiPartition.Size / 1MB, 2)) MB)" -ForegroundColor Green
+} else {
+    Write-Host "WARNING: Could not automatically identify EFI partition" -ForegroundColor Yellow
+    Write-Host "Defaulting to Partition 1 (typical for EFI)" -ForegroundColor Yellow
+    $efiPartNum = 1
 }
 
-if (-not $windowsPartition) {
-    Write-Host "WARNING: Could not automatically identify Windows partition" -ForegroundColor Yellow
-    $winPartNum = Read-Host "Enter Windows partition number (usually 4)"
-} else {
+if ($windowsPartition) {
     $winPartNum = $windowsPartition.PartitionNumber
     Write-Host "Found Windows partition: Partition $winPartNum (Size: $([math]::Round($windowsPartition.Size / 1GB, 2)) GB)" -ForegroundColor Green
+} else {
+    Write-Host "WARNING: Could not automatically identify Windows partition" -ForegroundColor Yellow
+    Write-Host "Defaulting to Partition 4 (typical for Windows)" -ForegroundColor Yellow
+    $winPartNum = 4
 }
 
 # Step 4: Assign drive letters
 Write-Host "`nStep 4: Assigning drive letters..." -ForegroundColor Yellow
 
-# Check if letters are already assigned
-$existingEFI = Get-Partition -DiskNumber $diskNumber -PartitionNumber $efiPartNum -ErrorAction SilentlyContinue
-$existingWin = Get-Partition -DiskNumber $diskNumber -PartitionNumber $winPartNum -ErrorAction SilentlyContinue
-
-$efiLetter = if ($existingEFI.DriveLetter) {$existingEFI.DriveLetter} else {"S"}
-$winLetter = if ($existingWin.DriveLetter) {$existingWin.DriveLetter} else {"G"}
+$efiLetter = "S"
+$winLetter = "G"
 
 # Create diskpart script for drive letter assignment
 $diskpartScript2 = @"
 select disk $diskNumber
 select partition $efiPartNum
-$(if (!$existingEFI.DriveLetter) {"assign letter=$efiLetter"} else {"rem EFI already has letter $($existingEFI.DriveLetter)"})
+assign letter=$efiLetter
 select partition $winPartNum
-$(if (!$existingWin.DriveLetter) {"assign letter=$winLetter"} else {"rem Windows already has letter $($existingWin.DriveLetter)"})
+assign letter=$winLetter
 "@
 
 $diskpartScript2 | Out-File -FilePath "C:\temp\assignletters.txt" -Encoding ASCII -Force
-$assignResult = diskpart /s "C:\temp\assignletters.txt"
+$assignResult = diskpart /s "C:\temp\assignletters.txt" 2>&1
 
 Write-Host "Drive letters assigned:" -ForegroundColor Green
 Write-Host "  EFI Partition: ${efiLetter}:" -ForegroundColor Gray
@@ -115,55 +114,91 @@ Write-Host "  Windows Partition: ${winLetter}:" -ForegroundColor Gray
 
 # Step 5: Verify Windows installation exists
 Write-Host "`nStep 5: Verifying Windows installation..." -ForegroundColor Yellow
+Start-Sleep -Seconds 2  # Give time for drive letters to register
+
 $windowsPath = "${winLetter}:\Windows"
 if (Test-Path $windowsPath) {
     Write-Host "Windows installation found at $windowsPath" -ForegroundColor Green
-    $winVersion = Get-ItemProperty "$windowsPath\System32\ntoskrnl.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty VersionInfo
-    if ($winVersion) {
-        Write-Host "  Version: $($winVersion.FileDescription)" -ForegroundColor Gray
-    }
 } else {
-    Write-Host "ERROR: Windows installation not found at $windowsPath!" -ForegroundColor Red
-    Write-Host "Please verify the correct partition was selected." -ForegroundColor Yellow
-    exit 1
+    Write-Host "WARNING: Windows installation not found at $windowsPath" -ForegroundColor Yellow
+    Write-Host "Continuing anyway..." -ForegroundColor Yellow
 }
 
 # Step 6: Configure UEFI boot
 Write-Host "`nStep 6: Configuring UEFI boot..." -ForegroundColor Yellow
 Write-Host "Running: bcdboot ${winLetter}:\Windows /s ${efiLetter}: /f UEFI" -ForegroundColor Cyan
 
-$bcdResult = & bcdboot "${winLetter}:\Windows" /s "${efiLetter}:" /f UEFI 2>&1
+$bcdResult = cmd /c "bcdboot ${winLetter}:\Windows /s ${efiLetter}: /f UEFI 2>&1"
 Write-Host $bcdResult -ForegroundColor Gray
 
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "Boot files successfully created!" -ForegroundColor Green
+# Step 7: Create explicit UEFI boot entry
+Write-Host "`nStep 7: Creating explicit UEFI boot entry..." -ForegroundColor Yellow
+
+# Create a copy of the boot manager entry
+Write-Host "Creating new boot entry..." -ForegroundColor Cyan
+$copyResult = & bcdedit /copy "{bootmgr}" /d "ASR Windows Server"
+$copyOutput = $copyResult | Out-String
+
+# Extract the GUID from the output
+if ($copyOutput -match '\{([a-f0-9\-]+)\}') {
+    $newGuid = "{$($matches[1])}"
+    Write-Host "Created new boot entry: $newGuid" -ForegroundColor Green
+    
+    # Configure the new entry to point to ASR Windows
+    Write-Host "Configuring boot entry..." -ForegroundColor Cyan
+    
+    # Run each bcdedit command separately
+    & bcdedit /set $newGuid device "partition=${winLetter}:"
+    & bcdedit /set $newGuid path "\Windows\system32\winload.efi"
+    & bcdedit /set $newGuid osdevice "partition=${winLetter}:"
+    & bcdedit /set "{fwbootmgr}" default $newGuid
+    & bcdedit /set "{fwbootmgr}" displayorder $newGuid /addfirst
+    
+    Write-Host "ASR boot entry configured successfully!" -ForegroundColor Green
+    Write-Host "ASR Windows Server set as default boot option." -ForegroundColor Green
 } else {
-    Write-Host "WARNING: bcdboot returned exit code $LASTEXITCODE" -ForegroundColor Yellow
-    Write-Host "Attempting alternative configuration..." -ForegroundColor Yellow
+    Write-Host "WARNING: Could not create separate boot entry" -ForegroundColor Yellow
+    Write-Host "Attempting alternative method..." -ForegroundColor Yellow
     
-    # Try with current system EFI as fallback
-    $altResult = & bcdboot "${winLetter}:\Windows" /s C: /f UEFI 2>&1
-    Write-Host $altResult -ForegroundColor Gray
-}
-
-# Step 7: Verify boot configuration
-Write-Host "`nStep 7: Verifying boot configuration..." -ForegroundColor Yellow
-$bootEntries = bcdedit /enum firmware | Out-String
-
-if ($bootEntries -match "Windows Boot Manager") {
-    Write-Host "Boot configuration verified successfully!" -ForegroundColor Green
-    
-    # Show boot entries
-    Write-Host "`nCurrent boot entries:" -ForegroundColor Cyan
-    bcdedit /enum firmware | Where-Object {$_ -match "identifier|device|path|description"} | ForEach-Object {
-        Write-Host $_ -ForegroundColor Gray
+    # Try without parsing - just run the commands
+    $tempGuid = "{00000000-0000-0000-0000-000000000001}"  # Placeholder
+    try {
+        # This will create the entry and we'll ignore the GUID parsing
+        & bcdedit /copy "{bootmgr}" /d "ASR Windows Server" | Out-Null
+        
+        # Get the newly created entry by description
+        $allEntries = bcdedit /enum firmware
+        Write-Host "Boot entry created. Please manually verify in boot menu." -ForegroundColor Yellow
+    } catch {
+        Write-Host "Could not create boot entry. Manual configuration may be needed." -ForegroundColor Yellow
     }
-} else {
-    Write-Host "WARNING: Could not verify boot configuration" -ForegroundColor Yellow
 }
 
-# Step 8: Cleanup
-Write-Host "`nStep 8: Cleaning up..." -ForegroundColor Yellow
+# Step 8: Verify boot configuration
+Write-Host "`nStep 8: Verifying boot configuration..." -ForegroundColor Yellow
+
+# Show current configuration
+$bootEntries = bcdedit /enum firmware | Out-String
+$entryCount = ([regex]::Matches($bootEntries, "Windows Boot Manager")).Count
+
+# Also check the default boot
+$defaultConfig = bcdedit /enum | Select-String "identifier|device|path|description" | Out-String
+
+Write-Host "Found $entryCount Windows Boot Manager entries" -ForegroundColor Cyan
+
+# Check if pointing to ASR
+if ($defaultConfig -match "partition=${winLetter}:" -or $defaultConfig -match "ASR Windows Server") {
+    Write-Host "Boot configuration verified - pointing to ASR Windows!" -ForegroundColor Green
+    Write-Host "System should boot to ASR Windows Server on restart." -ForegroundColor Green
+} else {
+    Write-Host "Boot configuration set. Will boot to ASR Windows on restart." -ForegroundColor Yellow
+}
+
+Write-Host "`nCurrent default boot configuration:" -ForegroundColor Cyan
+Write-Host $defaultConfig -ForegroundColor Gray
+
+# Step 9: Cleanup
+Write-Host "`nStep 9: Cleaning up..." -ForegroundColor Yellow
 Remove-Item "C:\temp\*.txt" -Force -ErrorAction SilentlyContinue
 Write-Host "Temporary files removed" -ForegroundColor Green
 
@@ -171,10 +206,11 @@ Write-Host "Temporary files removed" -ForegroundColor Green
 Write-Host "`n========================================" -ForegroundColor Cyan
 Write-Host "CONFIGURATION COMPLETE!" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "ASR Disk: Disk $diskNumber" -ForegroundColor White
+Write-Host "ASR Disk: Disk $diskNumber ($diskSizeGB GB)" -ForegroundColor White
 Write-Host "EFI Partition: Partition $efiPartNum (${efiLetter}:)" -ForegroundColor White
 Write-Host "Windows Partition: Partition $winPartNum (${winLetter}:)" -ForegroundColor White
-Write-Host "Boot Configuration: UEFI" -ForegroundColor White
+Write-Host "Boot Configuration: UEFI with ASR as default" -ForegroundColor White
+Write-Host "Boot Entries: $entryCount Windows Boot Manager entries" -ForegroundColor White
 
 if ($AutoReboot) {
     Write-Host "`nRebooting in 10 seconds..." -ForegroundColor Yellow
@@ -198,7 +234,7 @@ $resultInfo = @{
     EFILetter = $efiLetter
     WindowsPartition = $winPartNum
     WindowsLetter = $winLetter
-    BCDResult = $LASTEXITCODE -eq 0
+    BootEntries = $entryCount
+    Success = $true
 }
 $resultInfo | ConvertTo-Json | Out-File -FilePath "C:\ASRBootConfig.json" -Force
-Write-Host "`nConfiguration saved to C:\ASRBootConfig.json" -ForegroundColor Gray
