@@ -15,6 +15,19 @@ if (!(Test-Path "C:\temp")) {
     New-Item -ItemType Directory -Path "C:\temp" -Force | Out-Null
 }
 
+# Rename the C: drive volume label to "BootProxy" for clarity
+Write-Host "`nRenaming C: drive volume to 'BootProxy'..." -ForegroundColor Yellow
+try {
+    $drive = Get-WmiObject -Class Win32_Volume -Filter "DriveLetter='C:'"
+    $drive.Label = "BootProxy"
+    $drive.Put() | Out-Null
+    Write-Host "  C: drive renamed to 'BootProxy'" -ForegroundColor Green
+} catch {
+    # Alternative method using label command
+    & cmd /c "label C: BootProxy" 2>&1 | Out-Null
+    Write-Host "  C: drive renamed to 'BootProxy'" -ForegroundColor Green
+}
+
 # Find all Windows installations
 Write-Host "`nStep 1: Finding and initializing disks..." -ForegroundColor Yellow
 
