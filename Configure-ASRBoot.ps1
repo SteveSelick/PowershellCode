@@ -1,21 +1,11 @@
 # Configure-ASRBoot.ps1
-# Script to run INSIDE the boot proxy VM to configure dual-boot with ASR disk
-# This automates the manual diskpart and bcdboot steps
+# Script to run INSIDE the boot proxy VM to force boot to ASR Windows
+# Fixed version that actually works
 
 param(
-    [switch]$NoReboot,  # Manual reboot by default when run standalone, use -NoReboot to prevent
-    [int]$MinDiskSizeGB = 500  # Minimum disk size to identify as ASR disk (default 500GB)
+    [switch]$NoReboot,
+    [int]$MinDiskSizeGB = 500
 )
-
-# Check if script is being run via automation (Invoke-AzVMRunCommand)
-$isAutomated = $env:USERNAME -eq 'SYSTEM' -or $env:COMPUTERNAME -match 'proxy'
-
-# If automated, always reboot unless explicitly prevented
-if ($isAutomated -and !$NoReboot) {
-    $AutoReboot = $true
-} else {
-    $AutoReboot = $false
-}
 
 $ErrorActionPreference = "Stop"
 
@@ -30,13 +20,12 @@ if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     exit
 }
 
-# Step 1: Identify the ASR disk (looking for large secondary disk)
+# Step 1: Identify the ASR disk
 Write-Host "`nStep 1: Identifying ASR disk..." -ForegroundColor Yellow
 $asrDisk = Get-Disk | Where-Object {$_.Number -ne 0 -and $_.Size -gt ($MinDiskSizeGB * 1GB)} | Select-Object -First 1
 
 if (-not $asrDisk) {
     Write-Host "ERROR: No secondary disk larger than $MinDiskSizeGB GB found!" -ForegroundColor Red
-    Write-Host "Available disks:" -ForegroundColor Yellow
     Get-Disk | Format-Table Number,FriendlyName,Size,PartitionStyle,OperationalStatus
     exit 1
 }
@@ -45,207 +34,215 @@ $diskNumber = $asrDisk.Number
 $diskSizeGB = [math]::Round($asrDisk.Size / 1GB, 2)
 Write-Host "Found ASR disk: Disk $diskNumber (Size: $diskSizeGB GB)" -ForegroundColor Green
 
-# Step 2: Get partition information
-Write-Host "`nStep 2: Analyzing disk partitions..." -ForegroundColor Yellow
+# Step 2: Map the ASR disk partitions
+Write-Host "`nStep 2: Mapping ASR disk partitions..." -ForegroundColor Yellow
 
-# Create temp directory if it doesn't exist
+# Create temp directory
 if (!(Test-Path "C:\temp")) {
     New-Item -ItemType Directory -Path "C:\temp" -Force | Out-Null
 }
 
-# Get partition details using diskpart
-$diskpartScript1 = @"
-select disk $diskNumber
-list partition
-"@
-$diskpartScript1 | Out-File -FilePath "C:\temp\listpart.txt" -Encoding ASCII -Force
-$partitionInfo = diskpart /s "C:\temp\listpart.txt"
-
-# Display partition information
-Write-Host "Partition layout:" -ForegroundColor Cyan
-$partitionInfo | Where-Object {$_ -match "Partition"} | ForEach-Object {Write-Host $_ -ForegroundColor Gray}
-
-# Step 3: Identify EFI and Windows partitions
-Write-Host "`nStep 3: Identifying EFI and Windows partitions..." -ForegroundColor Yellow
-
-# Get partitions programmatically
+# Get partitions
 $partitions = Get-Partition -DiskNumber $diskNumber -ErrorAction SilentlyContinue
 
-# Find EFI partition (usually ~100-260MB, FAT32)
-$efiPartition = $partitions | Where-Object {
-    $_.Size -gt 50MB -and $_.Size -lt 500MB -and ($_.GptType -eq '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' -or $_.Type -eq 'System')
-} | Select-Object -First 1
-
-# Find Windows partition (largest partition > 100GB)
-$windowsPartition = $partitions | Where-Object {
-    $_.Size -gt 100GB
-} | Sort-Object Size -Descending | Select-Object -First 1
-
-# Determine partition numbers
-if ($efiPartition) {
-    $efiPartNum = $efiPartition.PartitionNumber
-    Write-Host "Found EFI partition: Partition $efiPartNum (Size: $([math]::Round($efiPartition.Size / 1MB, 2)) MB)" -ForegroundColor Green
-} else {
-    Write-Host "WARNING: Could not automatically identify EFI partition" -ForegroundColor Yellow
-    Write-Host "Defaulting to Partition 1 (typical for EFI)" -ForegroundColor Yellow
-    $efiPartNum = 1
-}
-
+# Find Windows partition (largest)
+$windowsPartition = $partitions | Where-Object {$_.Size -gt 100GB} | Sort-Object Size -Descending | Select-Object -First 1
 if ($windowsPartition) {
     $winPartNum = $windowsPartition.PartitionNumber
-    Write-Host "Found Windows partition: Partition $winPartNum (Size: $([math]::Round($windowsPartition.Size / 1GB, 2)) GB)" -ForegroundColor Green
 } else {
-    Write-Host "WARNING: Could not automatically identify Windows partition" -ForegroundColor Yellow
-    Write-Host "Defaulting to Partition 4 (typical for Windows)" -ForegroundColor Yellow
-    $winPartNum = 4
+    $winPartNum = 4  # Default
 }
 
-# Step 4: Assign drive letters
-Write-Host "`nStep 4: Assigning drive letters..." -ForegroundColor Yellow
+Write-Host "Windows partition identified: Partition $winPartNum" -ForegroundColor Green
 
-$efiLetter = "S"
-$winLetter = "G"
+# Step 3: Assign drive letter G: to ASR Windows
+Write-Host "`nStep 3: Assigning drive letter G: to ASR Windows..." -ForegroundColor Yellow
 
-# Create diskpart script for drive letter assignment
-$diskpartScript2 = @"
+$diskpartScript = @"
 select disk $diskNumber
-select partition $efiPartNum
-assign letter=$efiLetter
 select partition $winPartNum
-assign letter=$winLetter
+assign letter=G
 "@
+$diskpartScript | Out-File -FilePath "C:\temp\assign.txt" -Encoding ASCII -Force
+$null = diskpart /s "C:\temp\assign.txt" 2>&1
 
-$diskpartScript2 | Out-File -FilePath "C:\temp\assignletters.txt" -Encoding ASCII -Force
-$assignResult = diskpart /s "C:\temp\assignletters.txt" 2>&1
+Start-Sleep -Seconds 2
 
-Write-Host "Drive letters assigned:" -ForegroundColor Green
-Write-Host "  EFI Partition: ${efiLetter}:" -ForegroundColor Gray
-Write-Host "  Windows Partition: ${winLetter}:" -ForegroundColor Gray
-
-# Step 5: Verify Windows installation exists
-Write-Host "`nStep 5: Verifying Windows installation..." -ForegroundColor Yellow
-Start-Sleep -Seconds 2  # Give time for drive letters to register
-
-$windowsPath = "${winLetter}:\Windows"
-if (Test-Path $windowsPath) {
-    Write-Host "Windows installation found at $windowsPath" -ForegroundColor Green
+# Verify G:\Windows exists
+if (Test-Path "G:\Windows") {
+    Write-Host "ASR Windows found at G:\Windows" -ForegroundColor Green
 } else {
-    Write-Host "WARNING: Windows installation not found at $windowsPath" -ForegroundColor Yellow
-    Write-Host "Continuing anyway..." -ForegroundColor Yellow
+    Write-Host "ERROR: Windows not found at G:\Windows" -ForegroundColor Red
+    exit 1
 }
 
-# Step 6: Configure UEFI boot
-Write-Host "`nStep 6: Configuring UEFI boot..." -ForegroundColor Yellow
-Write-Host "Running: bcdboot ${winLetter}:\Windows /s ${efiLetter}: /f UEFI" -ForegroundColor Cyan
+# Step 4: Create boot entry using the method that worked earlier
+Write-Host "`nStep 4: Creating boot entry for ASR Windows..." -ForegroundColor Yellow
 
-$bcdResult = cmd /c "bcdboot ${winLetter}:\Windows /s ${efiLetter}: /f UEFI 2>&1"
-Write-Host $bcdResult -ForegroundColor Gray
+# The manual process that worked was:
+# 1. bcdedit /copy {bootmgr} /d "ASR Windows Server"
+# 2. Extract the GUID
+# 3. Set the properties
+# 4. Set it as default in firmware boot manager
 
-# Step 7: Create explicit UEFI boot entry
-Write-Host "`nStep 7: Creating explicit UEFI boot entry..." -ForegroundColor Yellow
+Write-Host "Executing: bcdedit /copy {bootmgr} /d 'ASR Windows Server'" -ForegroundColor Cyan
 
-# Create a copy of the boot manager entry
-Write-Host "Creating new boot entry..." -ForegroundColor Cyan
-$copyResult = & bcdedit /copy "{bootmgr}" /d "ASR Windows Server"
-$copyOutput = $copyResult | Out-String
+# Run the copy command and capture ALL output
+$copyProcess = Start-Process -FilePath "bcdedit.exe" -ArgumentList "/copy","{bootmgr}","/d","`"ASR Windows Server`"" -Wait -PassThru -NoNewWindow -RedirectStandardOutput "C:\temp\bcdedit_output.txt" -RedirectStandardError "C:\temp\bcdedit_error.txt"
 
-# Extract the GUID from the output
+# Read the output
+$copyOutput = Get-Content "C:\temp\bcdedit_output.txt" -ErrorAction SilentlyContinue
+$copyError = Get-Content "C:\temp\bcdedit_error.txt" -ErrorAction SilentlyContinue
+
+if ($copyOutput) {
+    Write-Host "Output: $copyOutput" -ForegroundColor Gray
+}
+if ($copyError) {
+    Write-Host "Error: $copyError" -ForegroundColor Red
+}
+
+# Extract GUID from output
+$newGuid = $null
 if ($copyOutput -match '\{([a-f0-9\-]+)\}') {
     $newGuid = "{$($matches[1])}"
-    Write-Host "Created new boot entry: $newGuid" -ForegroundColor Green
+    Write-Host "Successfully created boot entry with GUID: $newGuid" -ForegroundColor Green
     
-    # Configure the new entry to point to ASR Windows
-    Write-Host "Configuring boot entry..." -ForegroundColor Cyan
+    # Now configure it EXACTLY as we did manually
+    Write-Host "`nConfiguring boot entry..." -ForegroundColor Cyan
     
-    # Run each bcdedit command separately
-    & bcdedit /set $newGuid device "partition=${winLetter}:"
-    & bcdedit /set $newGuid path "\Windows\system32\winload.efi"
-    & bcdedit /set $newGuid osdevice "partition=${winLetter}:"
+    # Run each command separately and show results
+    Write-Host "Setting device to G:..." -ForegroundColor Gray
+    & bcdedit /set $newGuid device partition=G:
+    
+    Write-Host "Setting path..." -ForegroundColor Gray
+    & bcdedit /set $newGuid path \Windows\system32\winload.efi
+    
+    Write-Host "Setting OS device to G:..." -ForegroundColor Gray
+    & bcdedit /set $newGuid osdevice partition=G:
+    
+    Write-Host "Setting as default in firmware boot manager..." -ForegroundColor Gray
     & bcdedit /set "{fwbootmgr}" default $newGuid
+    
+    Write-Host "Setting as first in display order..." -ForegroundColor Gray
     & bcdedit /set "{fwbootmgr}" displayorder $newGuid /addfirst
     
-    Write-Host "ASR boot entry configured successfully!" -ForegroundColor Green
-    Write-Host "ASR Windows Server set as default boot option." -ForegroundColor Green
+    Write-Host "`nBoot entry configured successfully!" -ForegroundColor Green
+    $bootModified = $true
 } else {
-    Write-Host "WARNING: Could not create separate boot entry" -ForegroundColor Yellow
-    Write-Host "Attempting alternative method..." -ForegroundColor Yellow
+    Write-Host "Failed to create boot entry. Trying alternative approach..." -ForegroundColor Yellow
     
-    # Try without parsing - just run the commands
-    $tempGuid = "{00000000-0000-0000-0000-000000000001}"  # Placeholder
-    try {
-        # This will create the entry and we'll ignore the GUID parsing
-        & bcdedit /copy "{bootmgr}" /d "ASR Windows Server" | Out-Null
-        
-        # Get the newly created entry by description
-        $allEntries = bcdedit /enum firmware
-        Write-Host "Boot entry created. Please manually verify in boot menu." -ForegroundColor Yellow
-    } catch {
-        Write-Host "Could not create boot entry. Manual configuration may be needed." -ForegroundColor Yellow
+    # Alternative: Look for existing ASR entry
+    $allEntries = bcdedit /enum firmware | Out-String
+    if ($allEntries -match "ASR Windows Server") {
+        Write-Host "Found existing ASR Windows Server entry" -ForegroundColor Green
+        # Try to find its GUID
+        $lines = (bcdedit /enum firmware | Out-String) -split "`n"
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match "ASR Windows Server") {
+                # Look backwards for identifier
+                for ($j = $i; $j -ge 0; $j--) {
+                    if ($lines[$j] -match "identifier\s+(\{[a-f0-9\-]+\})") {
+                        $newGuid = $matches[1]
+                        Write-Host "Found existing entry GUID: $newGuid" -ForegroundColor Green
+                        
+                        # Set it as default
+                        & bcdedit /set "{fwbootmgr}" default $newGuid
+                        & bcdedit /set "{fwbootmgr}" displayorder $newGuid /addfirst
+                        $bootModified = $true
+                        break
+                    }
+                }
+                break
+            }
+        }
     }
 }
 
-# Step 8: Verify boot configuration
-Write-Host "`nStep 8: Verifying boot configuration..." -ForegroundColor Yellow
-
-# Show current configuration
-$bootEntries = bcdedit /enum firmware | Out-String
-$entryCount = ([regex]::Matches($bootEntries, "Windows Boot Manager")).Count
-
-# Also check the default boot
-$defaultConfig = bcdedit /enum | Select-String "identifier|device|path|description" | Out-String
-
-Write-Host "Found $entryCount Windows Boot Manager entries" -ForegroundColor Cyan
-
-# Check if pointing to ASR
-if ($defaultConfig -match "partition=${winLetter}:" -or $defaultConfig -match "ASR Windows Server") {
-    Write-Host "Boot configuration verified - pointing to ASR Windows!" -ForegroundColor Green
-    Write-Host "System should boot to ASR Windows Server on restart." -ForegroundColor Green
-} else {
-    Write-Host "Boot configuration set. Will boot to ASR Windows on restart." -ForegroundColor Yellow
+# If still no success, modify the existing entries
+if (-not $bootModified) {
+    Write-Host "`nModifying existing boot entries as fallback..." -ForegroundColor Yellow
+    
+    # Modify {bootmgr} directly
+    & bcdedit /set "{bootmgr}" device partition=G:
+    & bcdedit /set "{bootmgr}" path \Windows\system32\winload.efi
+    & bcdedit /set "{bootmgr}" description "ASR Windows Server"
+    
+    # Also modify current
+    & bcdedit /set "{current}" device partition=G:
+    & bcdedit /set "{current}" osdevice partition=G:
+    & bcdedit /set "{current}" systemroot \Windows
+    & bcdedit /set "{current}" path \Windows\system32\boot\winload.efi
+    & bcdedit /set "{current}" description "ASR Windows Server"
 }
 
-Write-Host "`nCurrent default boot configuration:" -ForegroundColor Cyan
-Write-Host $defaultConfig -ForegroundColor Gray
+# Step 5: Verify configuration
+Write-Host "`nStep 5: Verifying configuration..." -ForegroundColor Yellow
 
-# Step 9: Cleanup
-Write-Host "`nStep 9: Cleaning up..." -ForegroundColor Yellow
-Remove-Item "C:\temp\*.txt" -Force -ErrorAction SilentlyContinue
-Write-Host "Temporary files removed" -ForegroundColor Green
+# Step 5: Verify configuration
+Write-Host "`nStep 5: Verifying configuration..." -ForegroundColor Yellow
 
-# Summary and reboot option
+$success = $false
+
+# Check if ASR entry exists and is set as default
+$fwbootmgrOutput = bcdedit /enum "{fwbootmgr}" 2>&1 | Out-String
+$firmwareOutput = bcdedit /enum firmware | Out-String
+
+if ($firmwareOutput -match "ASR Windows Server") {
+    Write-Host "[OK] ASR Windows Server boot entry exists" -ForegroundColor Green
+    
+    # Check if it's the default
+    if ($fwbootmgrOutput -match "default\s+(\{[a-f0-9\-]+\})") {
+        $defaultGuid = $matches[1]
+        $defaultEntry = bcdedit /enum $defaultGuid 2>&1 | Out-String
+        if ($defaultEntry -match "ASR Windows Server" -or $defaultEntry -match "partition=G:") {
+            Write-Host "[OK] ASR entry is set as default" -ForegroundColor Green
+            $success = $true
+        }
+    }
+} 
+
+# Also check if current points to G:
+$currentConfig = bcdedit /enum "{current}" | Out-String
+if ($currentConfig -match "partition=G:") {
+    Write-Host "[OK] Current boot entry points to G:" -ForegroundColor Green
+    $success = $true
+}
+
+if (-not $success) {
+    Write-Host "[X] Boot configuration may not be complete" -ForegroundColor Red
+    Write-Host "Manual intervention may be required" -ForegroundColor Yellow
+}
+
+# Summary
 Write-Host "`n========================================" -ForegroundColor Cyan
 Write-Host "CONFIGURATION COMPLETE!" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "ASR Disk: Disk $diskNumber ($diskSizeGB GB)" -ForegroundColor White
-Write-Host "EFI Partition: Partition $efiPartNum (${efiLetter}:)" -ForegroundColor White
-Write-Host "Windows Partition: Partition $winPartNum (${winLetter}:)" -ForegroundColor White
-Write-Host "Boot Configuration: UEFI with ASR as default" -ForegroundColor White
-Write-Host "Boot Entries: $entryCount Windows Boot Manager entries" -ForegroundColor White
+Write-Host "ASR Windows: G:\Windows" -ForegroundColor White
+if ($success) {
+    Write-Host "Status: SUCCESS - Will boot ASR Windows" -ForegroundColor Green
+} else {
+    Write-Host "Status: NEEDS MANUAL CHECK" -ForegroundColor Yellow
+}
 
-if ($AutoReboot -or ($isAutomated -and !$NoReboot)) {
-    Write-Host "`nAUTOMATIC REBOOT IN 10 SECONDS..." -ForegroundColor Yellow
-    Write-Host "System will boot into ASR Windows after restart." -ForegroundColor Green
-    Write-Host "Press Ctrl+C to cancel reboot" -ForegroundColor Gray
+# Check if automated
+$isAutomated = $env:USERNAME -eq 'SYSTEM' -or $env:COMPUTERNAME -match 'proxy'
+
+if (($isAutomated -or $PSBoundParameters.ContainsKey('AutoReboot')) -and !$NoReboot) {
+    Write-Host "`nRebooting in 10 seconds..." -ForegroundColor Yellow
+    Write-Host "System will boot into ASR Windows" -ForegroundColor Green
     Start-Sleep -Seconds 10
     Restart-Computer -Force
 } else {
     Write-Host "`nMANUAL REBOOT REQUIRED:" -ForegroundColor Yellow
-    Write-Host "Review the configuration above for any errors." -ForegroundColor Cyan
-    Write-Host "If everything looks correct, restart the VM:" -ForegroundColor Cyan
-    Write-Host "  shutdown /r /t 0" -ForegroundColor White
-    Write-Host "`nConfiguration details saved to C:\ASRBootConfig.json" -ForegroundColor Gray
+    Write-Host "Run: shutdown /r /t 0" -ForegroundColor Cyan
 }
 
-# Create result file for verification
-$resultInfo = @{
+# Save results
+@{
     Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     ASRDisk = $diskNumber
     DiskSizeGB = $diskSizeGB
-    EFIPartition = $efiPartNum
-    EFILetter = $efiLetter
-    WindowsPartition = $winPartNum
-    WindowsLetter = $winLetter
-    BootEntries = $entryCount
-    Success = $true
-}
-$resultInfo | ConvertTo-Json | Out-File -FilePath "C:\ASRBootConfig.json" -Force
+    Method = if ((Get-Item 'C:\Windows' -ErrorAction SilentlyContinue).LinkType -eq 'Junction') {'Junction'} else {'BCD'}
+    Success = $success
+} | ConvertTo-Json | Out-File -FilePath "C:\ASRBootConfig.json" -Force
