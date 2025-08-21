@@ -30,50 +30,59 @@ try {
 }
 
 # Find all Windows installations
-Write-Host "`nStep 1: Finding and initializing disks..." -ForegroundColor Yellow
+Write-Host "`nStep 1: Finding and initializing ALL disks..." -ForegroundColor Yellow
 
 # First, bring all disks online
-$disks = Get-Disk | Where-Object {$_.OperationalStatus -eq 'Offline'}
-foreach ($disk in $disks) {
-    Write-Host "  Bringing Disk $($disk.Number) online..." -ForegroundColor Gray
-    Set-Disk -Number $disk.Number -IsOffline $false
+$allDisks = Get-Disk
+foreach ($disk in $allDisks) {
+    if ($disk.OperationalStatus -eq 'Offline') {
+        Write-Host "  Bringing Disk $($disk.Number) online..." -ForegroundColor Gray
+        Set-Disk -Number $disk.Number -IsOffline $false
+    }
 }
 
-# Find large disk (ASR disk is typically > 500GB and not disk 0)
-$asrDisk = Get-Disk | Where-Object {
-    $_.Size -gt 500GB -and $_.Number -ne 0
-} | Sort-Object Size -Descending | Select-Object -First 1
+# Check ALL disks and ALL partitions
+Write-Host "`nChecking ALL disks for Windows installations..." -ForegroundColor Yellow
 
-if ($asrDisk) {
-    Write-Host "  Found ASR disk: Disk $($asrDisk.Number) - Size: $([math]::Round($asrDisk.Size/1GB))GB" -ForegroundColor Green
+foreach ($disk in $allDisks) {
+    Write-Host "`n  Disk $($disk.Number) - Size: $([math]::Round($disk.Size/1GB))GB" -ForegroundColor Cyan
     
-    # Check all partitions on the ASR disk
-    $partitions = Get-Partition -DiskNumber $asrDisk.Number -ErrorAction SilentlyContinue
+    # Get all partitions on this disk
+    $partitions = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue
     
-    # First, show what partitions exist
-    Write-Host "  Partitions on Disk $($asrDisk.Number):" -ForegroundColor Gray
-    foreach ($p in $partitions) {
-        $sizeGB = [math]::Round($p.Size/1GB, 2)
-        $letter = if ($p.DriveLetter) { "$($p.DriveLetter):" } else { "No Letter" }
-        Write-Host "    Partition $($p.PartitionNumber): $sizeGB GB, Type: $($p.Type), Drive: $letter" -ForegroundColor Gray
-    }
-    
-    # Now assign letters to large partitions that don't have them
-    foreach ($partition in $partitions) {
-        # Look for large partitions (Windows is usually > 100GB)
-        if ($partition.Type -eq 'Basic' -and $partition.Size -gt 100GB) {
-            if (-not $partition.DriveLetter) {
-                # Find an available drive letter (skip D,E,F to avoid conflicts, start with G)
+    if ($partitions) {
+        Write-Host "  Partitions on Disk $($disk.Number):" -ForegroundColor Gray
+        foreach ($p in $partitions) {
+            $sizeGB = [math]::Round($p.Size/1GB, 2)
+            $letter = if ($p.DriveLetter) { "$($p.DriveLetter):" } else { "No Letter" }
+            Write-Host "    Partition $($p.PartitionNumber): $sizeGB GB, Type: $($p.Type), Drive: $letter" -ForegroundColor Gray
+        }
+        
+        # Check each partition for Windows
+        foreach ($partition in $partitions) {
+            # Skip very small partitions (< 10GB can't have Windows)
+            if ($partition.Size -lt 10GB) {
+                continue
+            }
+            
+            if ($partition.DriveLetter) {
+                # Check existing drive letter for Windows
+                $existingLetter = $partition.DriveLetter
+                if (Test-Path "${existingLetter}:\Windows\System32\ntoskrnl.exe") {
+                    Write-Host "    [FOUND] Windows on Disk $($disk.Number), Partition $($partition.PartitionNumber), Drive ${existingLetter}:" -ForegroundColor Green
+                }
+            } else {
+                # Partition has no letter, assign one and check
                 $usedLetters = (Get-PSDrive -PSProvider FileSystem).Name
                 $availableLetters = 'GHIJKLMNOPQRSTUVWXYZ'.ToCharArray() | Where-Object {$_ -notin $usedLetters}
                 
                 if ($availableLetters.Count -gt 0) {
                     $newLetter = $availableLetters[0]
-                    Write-Host "  Assigning drive letter $newLetter to partition $($partition.PartitionNumber) on Disk $($asrDisk.Number) (Size: $([math]::Round($partition.Size/1GB))GB)" -ForegroundColor Yellow
+                    Write-Host "    Assigning drive letter $newLetter to Disk $($disk.Number), Partition $($partition.PartitionNumber) (Size: $([math]::Round($partition.Size/1GB))GB)" -ForegroundColor Yellow
                     
                     # Use diskpart to assign letter
                     $diskpartScript = @"
-select disk $($asrDisk.Number)
+select disk $($disk.Number)
 select partition $($partition.PartitionNumber)
 assign letter=$newLetter
 "@
@@ -83,22 +92,24 @@ assign letter=$newLetter
                     
                     Start-Sleep -Seconds 2
                     
-                    # Verify Windows exists on this drive
+                    # Check for Windows
                     if (Test-Path "${newLetter}:\Windows\System32\ntoskrnl.exe") {
-                        Write-Host "  SUCCESS: Found Windows on ${newLetter}: drive!" -ForegroundColor Green
+                        Write-Host "    [FOUND] Windows on Disk $($disk.Number), Partition $($partition.PartitionNumber), Drive ${newLetter}:" -ForegroundColor Green
+                    } else {
+                        # No Windows, remove the drive letter to keep things clean
+                        $diskpartScript = @"
+select disk $($disk.Number)
+select partition $($partition.PartitionNumber)
+remove letter=$newLetter
+"@
+                        $diskpartScript | Out-File "C:\temp\removeletter.txt" -Encoding ASCII -Force
+                        $null = diskpart /s "C:\temp\removeletter.txt" 2>&1
+                        Remove-Item "C:\temp\removeletter.txt" -Force -ErrorAction SilentlyContinue
                     }
-                }
-            } else {
-                # Check if this existing letter has Windows
-                $existingLetter = $partition.DriveLetter
-                if (Test-Path "${existingLetter}:\Windows\System32\ntoskrnl.exe") {
-                    Write-Host "  Found Windows on existing drive ${existingLetter}:" -ForegroundColor Green
                 }
             }
         }
     }
-} else {
-    Write-Host "  WARNING: No large disk found (>500GB, not disk 0)" -ForegroundColor Yellow
 }
 
 Write-Host "`nStep 2: Searching for Windows installations..." -ForegroundColor Yellow
