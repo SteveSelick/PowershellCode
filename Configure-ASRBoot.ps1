@@ -155,64 +155,25 @@ Write-Host "[OK] Boot files created" -ForegroundColor Green
 # Step 6: Create boot entry using bcdedit /copy
 Write-Host "`nStep 6: Creating ASR boot entry..." -ForegroundColor Yellow
 
-# Use a temporary file to capture bcdedit output reliably
-$tempFile = "C:\temp\bcdedit_output.txt"
+# Force overwrite current boot configuration first
+Write-Host "Forcing boot configuration to ASR Windows..." -ForegroundColor Cyan
+& cmd /c "bcdboot ${winDriveLetter}:\Windows /s C: /f UEFI /v" 2>&1 | Out-String
 
-# Run bcdedit /copy and capture output to file
-$copyCommand = 'bcdedit /copy {bootmgr} /d "ASR Windows Server"'
-& cmd /c "$copyCommand > `"$tempFile`" 2>&1"
+# Now modify the existing boot entries to ensure they point to ASR
+Write-Host "Updating all boot entries to point to ASR Windows..." -ForegroundColor Cyan
+& cmd /c "bcdedit /set {current} device partition=${winDriveLetter}:" 2>&1
+& cmd /c "bcdedit /set {current} osdevice partition=${winDriveLetter}:" 2>&1
+& cmd /c "bcdedit /set {current} path \Windows\system32\boot\winload.efi" 2>&1
+& cmd /c "bcdedit /set {current} systemroot \Windows" 2>&1
+& cmd /c "bcdedit /set {current} description `"ASR Windows Server`"" 2>&1
 
-# Read the output and extract GUID
-$bcdeditOutput = Get-Content $tempFile -Raw
-Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+& cmd /c "bcdedit /set {default} device partition=${winDriveLetter}:" 2>&1
+& cmd /c "bcdedit /set {default} osdevice partition=${winDriveLetter}:" 2>&1
+& cmd /c "bcdedit /set {default} path \Windows\system32\boot\winload.efi" 2>&1
+& cmd /c "bcdedit /set {default} systemroot \Windows" 2>&1
+& cmd /c "bcdedit /set {default} description `"ASR Windows Server`"" 2>&1
 
-# Extract GUID using regex
-if ($bcdeditOutput -match '\{([a-f0-9\-]+)\}') {
-    $newGuid = "{$($matches[1])}"
-    Write-Host "[OK] Created boot entry with GUID: $newGuid" -ForegroundColor Green
-    
-    # Configure the new boot entry
-    Write-Host "Configuring boot entry..." -ForegroundColor Cyan
-    
-    # Run each bcdedit command separately and check results
-    $commands = @(
-        "bcdedit /set $newGuid device partition=${winDriveLetter}:",
-        "bcdedit /set $newGuid path \Windows\system32\winload.efi",
-        "bcdedit /set $newGuid osdevice partition=${winDriveLetter}:",
-        "bcdedit /set $newGuid systemroot \Windows",
-        "bcdedit /set {fwbootmgr} default $newGuid",
-        "bcdedit /set {fwbootmgr} displayorder $newGuid /addfirst"
-    )
-    
-    foreach ($cmd in $commands) {
-        Write-Host "  Running: $cmd" -ForegroundColor Gray
-        $result = & cmd /c "$cmd 2>&1"
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "  [OK]" -ForegroundColor Green
-        } else {
-            Write-Host "  [WARNING] Command may have failed: $result" -ForegroundColor Yellow
-        }
-    }
-    
-    Write-Host "[OK] Boot entry configured successfully" -ForegroundColor Green
-    
-} else {
-    Write-Host "[WARNING] Could not extract GUID from bcdedit output" -ForegroundColor Yellow
-    Write-Host "Output was: $bcdeditOutput" -ForegroundColor Gray
-    
-    # Fallback: Modify existing boot configuration
-    Write-Host "`nFallback: Modifying existing boot configuration..." -ForegroundColor Yellow
-    
-    & cmd /c "bcdedit /set {current} device partition=${winDriveLetter}:" 2>&1
-    & cmd /c "bcdedit /set {current} osdevice partition=${winDriveLetter}:" 2>&1
-    & cmd /c "bcdedit /set {current} path \Windows\system32\boot\winload.efi" 2>&1
-    & cmd /c "bcdedit /set {current} systemroot \Windows" 2>&1
-    & cmd /c "bcdedit /set {current} description `"ASR Windows Server`"" 2>&1
-    & cmd /c "bcdedit /set {default} device partition=${winDriveLetter}:" 2>&1
-    & cmd /c "bcdedit /set {default} osdevice partition=${winDriveLetter}:" 2>&1
-    
-    Write-Host "[OK] Modified existing boot configuration" -ForegroundColor Green
-}
+Write-Host "[OK] Boot configuration forced to ASR Windows" -ForegroundColor Green
 
 # Step 7: Verify configuration
 Write-Host "`nStep 7: Verifying boot configuration..." -ForegroundColor Yellow
