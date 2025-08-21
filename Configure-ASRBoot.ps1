@@ -15,17 +15,18 @@ if (!(Test-Path "C:\temp")) {
     New-Item -ItemType Directory -Path "C:\temp" -Force | Out-Null
 }
 
-# Rename the C: drive volume label to "BootProxy" for clarity
-Write-Host "`nRenaming C: drive volume to 'BootProxy'..." -ForegroundColor Yellow
+# Rename the current C: drive volume label to "BootProxy" for clarity
+# This is the proxy Windows that we're currently running in
+Write-Host "`nRenaming current boot volume to 'BootProxy'..." -ForegroundColor Yellow
 try {
     $drive = Get-WmiObject -Class Win32_Volume -Filter "DriveLetter='C:'"
     $drive.Label = "BootProxy"
     $drive.Put() | Out-Null
-    Write-Host "  C: drive renamed to 'BootProxy'" -ForegroundColor Green
+    Write-Host "  Current boot drive renamed to 'BootProxy'" -ForegroundColor Green
 } catch {
     # Alternative method using label command
     & cmd /c "label C: BootProxy" 2>&1 | Out-Null
-    Write-Host "  C: drive renamed to 'BootProxy'" -ForegroundColor Green
+    Write-Host "  Current boot drive renamed to 'BootProxy'" -ForegroundColor Green
 }
 
 # Find all Windows installations
@@ -193,10 +194,71 @@ $config = @{
 }
 $config | ConvertTo-Json | Out-File "C:\ASRBootConfig.json" -Force
 
+# Create a startup script to hide the BootProxy volume when booted into ASR Windows
+Write-Host "`nCreating startup script to hide BootProxy volume in ASR Windows..." -ForegroundColor Yellow
+$startupScript = @'
+# Hide-BootProxyVolume.ps1
+# This script runs at startup in the ASR Windows to hide the BootProxy volume
+
+# Check if we're running in the ASR Windows (not the BootProxy Windows)
+if (Test-Path "C:\Windows\System32\config\systemprofile\ASRWindows.flag") {
+    # We're in ASR Windows, hide the BootProxy volumes
+    
+    # Find all volumes labeled "BootProxy"
+    $volumes = Get-WmiObject -Class Win32_Volume | Where-Object { $_.Label -eq "BootProxy" }
+    
+    foreach ($volume in $volumes) {
+        if ($volume.DriveLetter) {
+            $driveLetter = $volume.DriveLetter.TrimEnd(':')
+            
+            # Remove drive letter to hide it from Explorer
+            $volume.DriveLetter = $null
+            $volume.Put() | Out-Null
+            
+            Write-Output "Hidden BootProxy volume (was $driveLetter:)"
+        }
+    }
+    
+    # Alternative: Set NoDrives registry key to hide specific drives
+    # This hides drives but keeps them accessible via path
+    # $hideDrives = 4  # Value 4 = C: drive
+    # Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Name "NoDrives" -Value $hideDrives -Type DWord
+}
+'@
+
+# Save the startup script to the ASR Windows drive
+$startupScriptPath = "${asrDrive}:\Windows\System32\GroupPolicy\Machine\Scripts\Startup\Hide-BootProxyVolume.ps1"
+$startupDir = Split-Path $startupScriptPath -Parent
+
+if (!(Test-Path $startupDir)) {
+    New-Item -ItemType Directory -Path $startupDir -Force | Out-Null
+}
+
+$startupScript | Out-File $startupScriptPath -Encoding UTF8 -Force
+
+# Create a flag file in ASR Windows to identify it
+New-Item -ItemType File -Path "${asrDrive}:\Windows\System32\config\systemprofile\ASRWindows.flag" -Force | Out-Null
+
+# Configure the script to run at startup via Group Policy
+$gptIniPath = "${asrDrive}:\Windows\System32\GroupPolicy\gpt.ini"
+$scriptsIniPath = "${asrDrive}:\Windows\System32\GroupPolicy\Machine\Scripts\scripts.ini"
+
+# Create or update scripts.ini
+$scriptsContent = @"
+[Startup]
+0CmdLine=powershell.exe -ExecutionPolicy Bypass -File C:\Windows\System32\GroupPolicy\Machine\Scripts\Startup\Hide-BootProxyVolume.ps1
+0Parameters=
+"@
+
+$scriptsContent | Out-File $scriptsIniPath -Encoding ASCII -Force
+
+Write-Host "  Startup script created to hide BootProxy volume in ASR Windows" -ForegroundColor Green
+
 Write-Host "`n========================================" -ForegroundColor Green
 Write-Host "BOOT CONFIGURATION FORCED!" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
 Write-Host "ASR Windows: ${asrDrive}:\Windows" -ForegroundColor Cyan
+Write-Host "BootProxy volume will be hidden when booted to ASR" -ForegroundColor Cyan
 
 # Handle reboot
 if (-not $NoReboot) {
