@@ -10,8 +10,71 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "ASR BOOT CONFIGURATION SCRIPT (v8)" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 
+# Create temp directory if it doesn't exist
+if (!(Test-Path "C:\temp")) {
+    New-Item -ItemType Directory -Path "C:\temp" -Force | Out-Null
+}
+
 # Find all Windows installations
-Write-Host "`nSearching for Windows installations..." -ForegroundColor Yellow
+Write-Host "`nStep 1: Finding and initializing disks..." -ForegroundColor Yellow
+
+# First, bring all disks online
+$disks = Get-Disk | Where-Object {$_.OperationalStatus -eq 'Offline'}
+foreach ($disk in $disks) {
+    Write-Host "  Bringing Disk $($disk.Number) online..." -ForegroundColor Gray
+    Set-Disk -Number $disk.Number -IsOffline $false
+}
+
+# Find large disk (ASR disk is typically > 500GB and not disk 0)
+$asrDisk = Get-Disk | Where-Object {
+    $_.Size -gt 500GB -and $_.Number -ne 0
+} | Sort-Object Size -Descending | Select-Object -First 1
+
+if ($asrDisk) {
+    Write-Host "  Found ASR disk: Disk $($asrDisk.Number) - Size: $([math]::Round($asrDisk.Size/1GB))GB" -ForegroundColor Green
+    
+    # Check all partitions on the ASR disk
+    $partitions = Get-Partition -DiskNumber $asrDisk.Number -ErrorAction SilentlyContinue
+    
+    foreach ($partition in $partitions) {
+        # Look for large partitions (Windows is usually on the largest partition)
+        if ($partition.Type -eq 'Basic' -and $partition.Size -gt 100GB) {
+            if (-not $partition.DriveLetter) {
+                # Find an available drive letter
+                $usedLetters = (Get-PSDrive -PSProvider FileSystem).Name
+                $availableLetters = 'GHIJKLMNOPQRSTUVWXYZ'.ToCharArray() | Where-Object {$_ -notin $usedLetters}
+                
+                if ($availableLetters.Count -gt 0) {
+                    $newLetter = $availableLetters[0]
+                    Write-Host "  Assigning drive letter $newLetter to partition $($partition.PartitionNumber) on Disk $($asrDisk.Number) (Size: $([math]::Round($partition.Size/1GB))GB)" -ForegroundColor Yellow
+                    
+                    # Use diskpart to assign letter
+                    $diskpartScript = @"
+select disk $($asrDisk.Number)
+select partition $($partition.PartitionNumber)
+assign letter=$newLetter
+"@
+                    $diskpartScript | Out-File "C:\temp\assignletter.txt" -Encoding ASCII -Force
+                    $null = diskpart /s "C:\temp\assignletter.txt" 2>&1
+                    Remove-Item "C:\temp\assignletter.txt" -Force -ErrorAction SilentlyContinue
+                    
+                    Start-Sleep -Seconds 2
+                    
+                    # Verify Windows exists on this drive
+                    if (Test-Path "${newLetter}:\Windows\System32\ntoskrnl.exe") {
+                        Write-Host "  SUCCESS: Found Windows on ${newLetter}: drive!" -ForegroundColor Green
+                    }
+                }
+            } else {
+                Write-Host "  Partition $($partition.PartitionNumber) already has drive letter $($partition.DriveLetter):" -ForegroundColor Gray
+            }
+        }
+    }
+} else {
+    Write-Host "  WARNING: No large disk found (>500GB, not disk 0)" -ForegroundColor Yellow
+}
+
+Write-Host "`nStep 2: Searching for Windows installations..." -ForegroundColor Yellow
 
 $windowsFound = @()
 
