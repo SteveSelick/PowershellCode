@@ -50,11 +50,20 @@ if ($asrDisk) {
     # Check all partitions on the ASR disk
     $partitions = Get-Partition -DiskNumber $asrDisk.Number -ErrorAction SilentlyContinue
     
+    # First, show what partitions exist
+    Write-Host "  Partitions on Disk $($asrDisk.Number):" -ForegroundColor Gray
+    foreach ($p in $partitions) {
+        $sizeGB = [math]::Round($p.Size/1GB, 2)
+        $letter = if ($p.DriveLetter) { "$($p.DriveLetter):" } else { "No Letter" }
+        Write-Host "    Partition $($p.PartitionNumber): $sizeGB GB, Type: $($p.Type), Drive: $letter" -ForegroundColor Gray
+    }
+    
+    # Now assign letters to large partitions that don't have them
     foreach ($partition in $partitions) {
-        # Look for large partitions (Windows is usually on the largest partition)
+        # Look for large partitions (Windows is usually > 100GB)
         if ($partition.Type -eq 'Basic' -and $partition.Size -gt 100GB) {
             if (-not $partition.DriveLetter) {
-                # Find an available drive letter
+                # Find an available drive letter (skip D,E,F to avoid conflicts, start with G)
                 $usedLetters = (Get-PSDrive -PSProvider FileSystem).Name
                 $availableLetters = 'GHIJKLMNOPQRSTUVWXYZ'.ToCharArray() | Where-Object {$_ -notin $usedLetters}
                 
@@ -80,7 +89,11 @@ assign letter=$newLetter
                     }
                 }
             } else {
-                Write-Host "  Partition $($partition.PartitionNumber) already has drive letter $($partition.DriveLetter):" -ForegroundColor Gray
+                # Check if this existing letter has Windows
+                $existingLetter = $partition.DriveLetter
+                if (Test-Path "${existingLetter}:\Windows\System32\ntoskrnl.exe") {
+                    Write-Host "  Found Windows on existing drive ${existingLetter}:" -ForegroundColor Green
+                }
             }
         }
     }
