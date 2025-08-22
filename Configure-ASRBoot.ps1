@@ -291,18 +291,12 @@ Write-Host "ASR Windows: ${asrDrive}:\Windows" -ForegroundColor Cyan
 
 # Handle reboot
 if (-not $NoReboot) {
-    # Detect if running in automation (as SYSTEM or via Run Command)
-    $isAutomated = ($env:USERNAME -eq "SYSTEM") -or ($env:COMPUTERNAME -match "bootproxy")
-    
-    if ($isAutomated) {
-        Write-Host "`nAutomated execution detected - rebooting in 10 seconds..." -ForegroundColor Yellow
-        Write-Host "VM will boot into ASR Windows Server after restart" -ForegroundColor Green
-        Start-Sleep -Seconds 10
-        Restart-Computer -Force
-    } else {
-        Write-Host "`nManual execution - please reboot when ready:" -ForegroundColor Yellow
-        Write-Host "  shutdown /r /t 0" -ForegroundColor Cyan
-    }
+    # Always auto-reboot (since this script is primarily used in automation)
+    Write-Host "`nConfiguration completed - rebooting in 10 seconds..." -ForegroundColor Yellow
+    Write-Host "VM will boot into ASR Windows Server after restart" -ForegroundColor Green
+    Write-Host "(Press Ctrl+C to cancel if running manually)" -ForegroundColor Gray
+    Start-Sleep -Seconds 10
+    Restart-Computer -Force
 } else {
     Write-Host "`nReboot skipped (NoReboot parameter specified)" -ForegroundColor Yellow
     Write-Host "Please reboot manually to apply changes: shutdown /r /t 0" -ForegroundColor Cyan
