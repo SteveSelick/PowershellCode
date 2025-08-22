@@ -1,665 +1,346 @@
-# Configure-ASRBoot.ps1
-# Universal ASR Boot Configuration Script v2.1
-# Configures boot from ASR replicated disk in Azure VMs
-# Auto-handles SYSTEM context by scheduling task as local admin
+# Configure-ASRBoot.ps1 (v8)
+# Aggressive script to force boot to ASR Windows
+# Run this INSIDE the bootproxy VM
 
 param(
-    [switch]$NoReboot,
-    [switch]$ForceReboot,
-    [switch]$Verbose,
-    [string]$LogPath = "C:\temp\ASRBootConfig.log",
-    [switch]$RunningFromTask  # Internal parameter to indicate task execution
+    [switch]$NoReboot
 )
 
-# Initialize script
-$ErrorActionPreference = "Stop"
-$script:LogMessages = @()
-$script:HasErrors = $false
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "ASR BOOT CONFIGURATION SCRIPT (v8)" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
 
-# Ensure temp directory exists
-New-Item -ItemType Directory -Path "C:\temp" -Force -ErrorAction SilentlyContinue | Out-Null
+# Create temp directory if it doesn't exist
+if (!(Test-Path "C:\temp")) {
+    New-Item -ItemType Directory -Path "C:\temp" -Force | Out-Null
+}
 
-# Logging function
-function Write-Log {
-    param(
-        [string]$Message,
-        [ValidateSet("Info", "Warning", "Error", "Success")]
-        [string]$Level = "Info"
-    )
-    
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logEntry = "$timestamp [$Level] $Message"
-    $script:LogMessages += $logEntry
-    
-    # Write to file immediately
-    $logEntry | Out-File -FilePath $LogPath -Append -Force -ErrorAction SilentlyContinue
-    
-    # Console output with colors
-    switch ($Level) {
-        "Error" { 
-            Write-Host $Message -ForegroundColor Red
-            $script:HasErrors = $true
-        }
-        "Warning" { Write-Host $Message -ForegroundColor Yellow }
-        "Success" { Write-Host $Message -ForegroundColor Green }
-        default { Write-Host $Message -ForegroundColor Gray }
+# Rename the current C: drive volume label to "BootProxy" for clarity
+# This is the proxy Windows that we're currently running in
+Write-Host "`nRenaming current boot volume to 'BootProxy'..." -ForegroundColor Yellow
+try {
+    $drive = Get-WmiObject -Class Win32_Volume -Filter "DriveLetter='C:'"
+    # Only rename if it's the small boot proxy disk (< 200GB)
+    if ($drive.Capacity -lt 200GB) {
+        $drive.Label = "BootProxy"
+        $drive.Put() | Out-Null
+        Write-Host "  Current boot drive renamed to 'BootProxy'" -ForegroundColor Green
+    } else {
+        Write-Host "  Current C: drive is large ($([math]::Round($drive.Capacity/1GB))GB), skipping rename" -ForegroundColor Yellow
+    }
+} catch {
+    # Alternative method using label command
+    $vol = Get-Volume -DriveLetter C -ErrorAction SilentlyContinue
+    if ($vol -and $vol.Size -lt 200GB) {
+        & cmd /c "label C: BootProxy" 2>&1 | Out-Null
+        Write-Host "  Current boot drive renamed to 'BootProxy'" -ForegroundColor Green
     }
 }
 
-# Function to check if running as SYSTEM
-function Test-RunningAsSystem {
-    return $env:USERNAME -eq "SYSTEM"
+# Find all Windows installations
+Write-Host "`nStep 1: Finding and initializing ALL disks..." -ForegroundColor Yellow
+
+# First, bring all disks online
+$allDisks = Get-Disk
+foreach ($disk in $allDisks) {
+    if ($disk.OperationalStatus -eq 'Offline') {
+        Write-Host "  Bringing Disk $($disk.Number) online..." -ForegroundColor Gray
+        Set-Disk -Number $disk.Number -IsOffline $false
+    }
 }
 
-# Function to handle SYSTEM context by creating scheduled task
-function Handle-SystemContext {
-    Write-Log "=========================================" -Level Info
-    Write-Log "SYSTEM CONTEXT DETECTED" -Level Warning
-    Write-Log "=========================================" -Level Info
-    Write-Log "Running as SYSTEM - will create scheduled task for local admin" -Level Info
+# Check ALL disks and ALL partitions
+Write-Host "`nChecking ALL disks for Windows installations..." -ForegroundColor Yellow
+
+foreach ($disk in $allDisks) {
+    Write-Host "`n  Disk $($disk.Number) - Size: $([math]::Round($disk.Size/1GB))GB" -ForegroundColor Cyan
     
-    try {
-        # Known credentials for boot proxy VMs
-        $adminUser = "bootadmin"
-        $adminPassword = "TempP@ss2024!"
-        
-        Write-Log "Creating scheduled task to run as $adminUser" -Level Info
-        
-        # Create the task action - download and run the script with RunningFromTask flag
-        $taskName = "ASRBootConfig_Admin"
-        $scriptCommand = @"
-powershell.exe -ExecutionPolicy Bypass -Command "& {
-    # Ensure temp directory exists
-    New-Item -ItemType Directory -Path 'C:\temp' -Force -ErrorAction SilentlyContinue | Out-Null
+    # Get all partitions on this disk
+    $partitions = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue
     
-    # Download the script
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    `$url = 'https://raw.githubusercontent.com/SteveSelick/PowershellCode/main/Configure-ASRBoot.ps1'
-    `$scriptPath = 'C:\temp\Configure-ASRBoot.ps1'
-    
-    Write-Host 'Downloading Configure-ASRBoot.ps1...'
-    Invoke-WebRequest -Uri `$url -OutFile `$scriptPath -UseBasicParsing
-    
-    # Run the script with RunningFromTask flag
-    Write-Host 'Executing Configure-ASRBoot.ps1 as $adminUser...'
-    & `$scriptPath -RunningFromTask -NoReboot
-}"
-"@
+    if ($partitions) {
+        Write-Host "  Partitions on Disk $($disk.Number):" -ForegroundColor Gray
+        foreach ($p in $partitions) {
+            $sizeGB = [math]::Round($p.Size/1GB, 2)
+            $letter = if ($p.DriveLetter) { "$($p.DriveLetter):" } else { "No Letter" }
+            Write-Host "    Partition $($p.PartitionNumber): $sizeGB GB, Type: $($p.Type), Drive: $letter" -ForegroundColor Gray
+        }
         
-        # Create scheduled task XML with credentials
-        $taskXml = @"
-<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Date>$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')</Date>
-    <Author>ASRBootConfig</Author>
-    <Description>Run ASR Boot Configuration as local admin</Description>
-  </RegistrationInfo>
-  <Triggers>
-    <TimeTrigger>
-      <StartBoundary>$(Get-Date (Get-Date).AddSeconds(30) -Format 'yyyy-MM-ddTHH:mm:ss')</StartBoundary>
-      <Enabled>true</Enabled>
-    </TimeTrigger>
-  </Triggers>
-  <Principals>
-    <Principal id="Author">
-      <UserId>$adminUser</UserId>
-      <LogonType>Password</LogonType>
-      <RunLevel>HighestAvailable</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <IdleSettings>
-      <StopOnIdleEnd>false</StopOnIdleEnd>
-      <RestartOnIdle>false</RestartOnIdle>
-    </IdleSettings>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
-    <Priority>7</Priority>
-    <DeleteExpiredTaskAfter>PT0S</DeleteExpiredTaskAfter>
-  </Settings>
-  <Actions Context="Author">
-    <Exec>
-      <Command>cmd.exe</Command>
-      <Arguments>/c $scriptCommand</Arguments>
-    </Exec>
-  </Actions>
-</Task>
-"@
-        
-        # Save XML to temp file
-        $xmlPath = "C:\temp\ASRBootTask.xml"
-        $taskXml | Out-File -FilePath $xmlPath -Encoding Unicode -Force
-        
-        # Register the task with credentials
-        Write-Log "Registering scheduled task '$taskName'" -Level Info
-        $registerResult = schtasks /create /tn "$taskName" /xml "$xmlPath" /ru "$adminUser" /rp "$adminPassword" /f 2>&1
-        
-        if ($LASTEXITCODE -eq 0) {
-            Write-Log "Scheduled task created successfully" -Level Success
-            Write-Log "Task will run in 30 seconds as $adminUser" -Level Info
-            
-            # Wait for the task to start and complete
-            Write-Log "Waiting for task to start..." -Level Info
-            Start-Sleep -Seconds 35  # Wait for task to trigger
-            
-            # Monitor task execution
-            $maxWait = 120  # Max 2 minutes
-            $waited = 0
-            $taskCompleted = $false
-            
-            while ($waited -lt $maxWait) {
-                $taskInfo = schtasks /query /tn "$taskName" /fo CSV | ConvertFrom-Csv
-                $taskStatus = $taskInfo.Status
-                
-                if ($taskStatus -eq "Ready") {
-                    # Task completed
-                    Write-Log "Task completed successfully" -Level Success
-                    $taskCompleted = $true
-                    break
-                } elseif ($taskStatus -eq "Running") {
-                    Write-Log "Task is running... (waited $waited seconds)" -Level Info
-                } else {
-                    Write-Log "Task status: $taskStatus" -Level Info
-                }
-                
-                Start-Sleep -Seconds 5
-                $waited += 5
+        # Check each partition for Windows
+        foreach ($partition in $partitions) {
+            # Skip very small partitions (< 10GB can't have Windows)
+            if ($partition.Size -lt 10GB) {
+                continue
             }
             
-            if (!$taskCompleted) {
-                Write-Log "Warning: Task did not complete within expected time" -Level Warning
-            }
-            
-            # Check if configuration was successful by looking for the config file
-            if (Test-Path "C:\ASRBootConfig.json") {
-                $config = Get-Content "C:\ASRBootConfig.json" | ConvertFrom-Json
-                if ($config.Success) {
-                    Write-Log "Boot configuration completed successfully!" -Level Success
-                    
-                    # Delete the scheduled task
-                    Write-Log "Removing scheduled task" -Level Info
-                    schtasks /delete /tn "$taskName" /f 2>&1 | Out-Null
-                    
-                    # Clean up XML file
-                    Remove-Item -Path $xmlPath -Force -ErrorAction SilentlyContinue
-                    
-                    # Reboot the system
-                    Write-Log "Initiating system reboot in 10 seconds..." -Level Info
-                    shutdown /r /t 10 /f /c "ASR Boot Configuration Complete - Rebooting to apply changes"
-                    
-                    Write-Log "=========================================" -Level Info
-                    Write-Log "SYSTEM WILL REBOOT IN 10 SECONDS" -Level Success
-                    Write-Log "=========================================" -Level Info
-                    
-                    return $true
-                } else {
-                    Write-Log "Configuration failed: $($config.ErrorMessage)" -Level Error
+            if ($partition.DriveLetter) {
+                # Check existing drive letter for Windows
+                $existingLetter = $partition.DriveLetter
+                if (Test-Path "${existingLetter}:\Windows\System32\ntoskrnl.exe") {
+                    Write-Host "    [FOUND] Windows on Disk $($disk.Number), Partition $($partition.PartitionNumber), Drive ${existingLetter}:" -ForegroundColor Green
                 }
             } else {
-                Write-Log "Configuration file not found - task may have failed" -Level Error
-            }
-            
-            # Clean up task if still exists
-            schtasks /delete /tn "$taskName" /f 2>&1 | Out-Null
-            
-        } else {
-            Write-Log "Failed to create scheduled task: $registerResult" -Level Error
-        }
-        
-        return $false
-        
-    } catch {
-        Write-Log "Error handling SYSTEM context: $_" -Level Error
-        return $false
-    }
-}
-
-# Function to prepare disks
-function Initialize-Disks {
-    Write-Log "Initializing disk configuration..." -Level Info
-    
-    try {
-        # Get all disks
-        $disks = Get-Disk
-        $disksPrepared = 0
-        
-        foreach ($disk in $disks) {
-            $changes = @()
-            
-            # Check if disk needs to be brought online
-            if ($disk.OperationalStatus -eq 'Offline') {
-                try {
-                    Set-Disk -Number $disk.Number -IsOffline $false
-                    $changes += "brought online"
-                    Write-Log "Disk $($disk.Number): Brought online" -Level Success
-                } catch {
-                    Write-Log "Disk $($disk.Number): Failed to bring online - $_" -Level Warning
-                }
-            }
-            
-            # Check if disk is read-only
-            if ($disk.IsReadOnly) {
-                try {
-                    Set-Disk -Number $disk.Number -IsReadOnly $false
-                    $changes += "read-only removed"
-                    Write-Log "Disk $($disk.Number): Removed read-only flag" -Level Success
-                } catch {
-                    Write-Log "Disk $($disk.Number): Failed to remove read-only - $_" -Level Warning
-                }
-            }
-            
-            if ($changes.Count -gt 0) {
-                $disksPrepared++
-            }
-        }
-        
-        # Now assign drive letters to any large NTFS partitions without them
-        Write-Log "Checking for partitions without drive letters..." -Level Info
-        $partitionsFixed = 0
-        
-        $allPartitions = Get-Partition | Where-Object { 
-            $_.Type -eq 'Basic' -and 
-            $_.DriveLetter -eq 0 -and 
-            $_.Size -gt 10GB 
-        }
-        
-        foreach ($partition in $allPartitions) {
-            try {
-                # Find next available drive letter (starting from F:)
-                $usedLetters = (Get-Partition | Where-Object {$_.DriveLetter} | Select-Object -ExpandProperty DriveLetter)
-                $availableLetters = 70..90 | ForEach-Object { [char]$_ } | Where-Object { $_ -notin $usedLetters -and $_ -ne 'C' }
+                # Partition has no letter, assign one and check
+                $usedLetters = (Get-PSDrive -PSProvider FileSystem).Name
+                $availableLetters = 'GHIJKLMNOPQRSTUVWXYZ'.ToCharArray() | Where-Object {$_ -notin $usedLetters}
                 
                 if ($availableLetters.Count -gt 0) {
                     $newLetter = $availableLetters[0]
-                    Set-Partition -InputObject $partition -NewDriveLetter $newLetter
-                    Write-Log "Assigned drive letter $newLetter to Disk $($partition.DiskNumber) Partition $($partition.PartitionNumber) (Size: $([math]::Round($partition.Size/1GB,2)) GB)" -Level Success
-                    $partitionsFixed++
-                    Start-Sleep -Seconds 2  # Give Windows time to recognize the new drive letter
+                    Write-Host "    Assigning drive letter $newLetter to Disk $($disk.Number), Partition $($partition.PartitionNumber) (Size: $([math]::Round($partition.Size/1GB))GB)" -ForegroundColor Yellow
+                    
+                    # Use diskpart to assign letter
+                    $diskpartScript = @"
+select disk $($disk.Number)
+select partition $($partition.PartitionNumber)
+assign letter=$newLetter
+"@
+                    $diskpartScript | Out-File "C:\temp\assignletter.txt" -Encoding ASCII -Force
+                    $null = diskpart /s "C:\temp\assignletter.txt" 2>&1
+                    Remove-Item "C:\temp\assignletter.txt" -Force -ErrorAction SilentlyContinue
+                    
+                    Start-Sleep -Seconds 2
+                    
+                    # Check for Windows
+                    if (Test-Path "${newLetter}:\Windows\System32\ntoskrnl.exe") {
+                        Write-Host "    [FOUND] Windows on Disk $($disk.Number), Partition $($partition.PartitionNumber), Drive ${newLetter}:" -ForegroundColor Green
+                    } else {
+                        # No Windows, remove the drive letter to keep things clean
+                        $diskpartScript = @"
+select disk $($disk.Number)
+select partition $($partition.PartitionNumber)
+remove letter=$newLetter
+"@
+                        $diskpartScript | Out-File "C:\temp\removeletter.txt" -Encoding ASCII -Force
+                        $null = diskpart /s "C:\temp\removeletter.txt" 2>&1
+                        Remove-Item "C:\temp\removeletter.txt" -Force -ErrorAction SilentlyContinue
+                    }
                 }
-            } catch {
-                Write-Log "Failed to assign drive letter to partition: $_" -Level Warning
             }
         }
-        
-        if ($partitionsFixed -gt 0) {
-            Write-Log "Assigned drive letters to $partitionsFixed partition(s)" -Level Success
-        }
-        
-        if ($disksPrepared -gt 0 -or $partitionsFixed -gt 0) {
-            Write-Log "Disk preparation complete - prepared $disksPrepared disk(s), fixed $partitionsFixed partition(s)" -Level Success
-            Start-Sleep -Seconds 3  # Give disks time to fully initialize
-        }
-        
-        return $true
-    } catch {
-        Write-Log "Error during disk initialization: $_" -Level Error
-        return $false
     }
 }
 
-# Function to find ASR Windows installation
-function Find-ASRWindows {
-    Write-Log "Searching for ASR Windows installation..." -Level Info
-    
-    $windowsInstallations = @()
-    
-    # Get all volumes with drive letters
-    $volumes = Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveLetter -ne 'C' }
-    
-    foreach ($volume in $volumes) {
-        $driveLetter = $volume.DriveLetter
-        $windowsPath = "${driveLetter}:\Windows"
-        $systemPath = "${driveLetter}:\Windows\System32"
-        
-        if ((Test-Path $windowsPath) -and (Test-Path $systemPath)) {
-            # Check if it's the ASR disk (usually larger than boot proxy disk)
-            $sizeGB = [math]::Round($volume.Size / 1GB, 2)
-            
-            # Get more details about this Windows installation
-            $buildInfo = $null
-            $registryPath = "${driveLetter}:\Windows\System32\config\SOFTWARE"
-            
-            $installation = [PSCustomObject]@{
-                DriveLetter = $driveLetter
-                Volume = $volume
-                SizeGB = $sizeGB
-                WindowsPath = $windowsPath
-                IsLikelyASR = $sizeGB -gt 150  # ASR disks are typically larger
-            }
-            
-            $windowsInstallations += $installation
-            
-            Write-Log "Found Windows on drive $driveLetter (Size: $sizeGB GB)" -Level Info
-        }
-    }
-    
-    # Sort by size (largest first) and prefer likely ASR disks
-    $windowsInstallations = $windowsInstallations | Sort-Object -Property IsLikelyASR, SizeGB -Descending
-    
-    if ($windowsInstallations.Count -eq 0) {
-        Write-Log "No Windows installations found on attached disks" -Level Error
-        return $null
-    }
-    
-    if ($windowsInstallations.Count -eq 1) {
-        Write-Log "Found single Windows installation on drive $($windowsInstallations[0].DriveLetter)" -Level Success
-        return $windowsInstallations[0]
-    }
-    
-    # Multiple installations found - select the most likely ASR disk
-    $selected = $windowsInstallations[0]
-    Write-Log "Multiple Windows installations found. Selecting drive $($selected.DriveLetter) (largest: $($selected.SizeGB) GB)" -Level Info
-    
-    return $selected
-}
+Write-Host "`nStep 2: Searching for Windows installations..." -ForegroundColor Yellow
 
-# Function to find and prepare EFI partition
-function Prepare-EFIPartition {
-    param(
-        [Parameter(Mandatory=$true)]
-        $ASRDisk
-    )
-    
-    Write-Log "Preparing EFI partition..." -Level Info
-    
-    try {
-        # Find the disk number for the ASR volume
-        $partition = Get-Partition -DriveLetter $ASRDisk.DriveLetter -ErrorAction SilentlyContinue
-        if (!$partition) {
-            Write-Log "Could not find partition for drive $($ASRDisk.DriveLetter)" -Level Error
-            return $null
-        }
-        
-        $diskNumber = $partition.DiskNumber
-        Write-Log "ASR disk identified as Disk $diskNumber" -Level Info
-        
-        # Find EFI partition on the same disk
-        $efiPartition = Get-Partition -DiskNumber $diskNumber | Where-Object { $_.Type -eq 'System' }
-        
-        if (!$efiPartition) {
-            # Try to find EFI on disk 0 (boot disk)
-            Write-Log "No EFI partition on ASR disk, checking boot disk..." -Level Warning
-            $efiPartition = Get-Partition -DiskNumber 0 | Where-Object { $_.Type -eq 'System' }
-        }
-        
-        if (!$efiPartition) {
-            Write-Log "No EFI partition found on any disk" -Level Error
-            return $null
-        }
-        
-        Write-Log "Found EFI partition: Disk $($efiPartition.DiskNumber), Partition $($efiPartition.PartitionNumber)" -Level Success
-        
-        # Check if EFI partition has a drive letter
-        if (!$efiPartition.DriveLetter) {
-            Write-Log "EFI partition needs drive letter assignment" -Level Info
-            
-            # Use diskpart to assign drive letter
-            $diskpartScript = @"
-select disk $($efiPartition.DiskNumber)
-select partition $($efiPartition.PartitionNumber)
-assign letter=S
-exit
-"@
-            $scriptPath = "C:\temp\assign_efi.txt"
-            $diskpartScript | Out-File -FilePath $scriptPath -Encoding ASCII -Force
-            
-            $result = Start-Process -FilePath "diskpart.exe" -ArgumentList "/s `"$scriptPath`"" -Wait -NoNewWindow -PassThru
-            
-            if ($result.ExitCode -eq 0) {
-                Write-Log "Successfully assigned drive letter S to EFI partition" -Level Success
-                Start-Sleep -Seconds 2
-                
-                # Refresh partition info
-                $efiPartition = Get-Partition -DiskNumber $efiPartition.DiskNumber -PartitionNumber $efiPartition.PartitionNumber
-            } else {
-                Write-Log "Failed to assign drive letter to EFI partition using diskpart" -Level Error
-                return $null
-            }
-        }
-        
-        return $efiPartition
-        
-    } catch {
-        Write-Log "Error preparing EFI partition: $_" -Level Error
-        return $null
-    }
-}
+$windowsFound = @()
 
-# Function to configure boot
-function Set-BootConfiguration {
-    param(
-        [Parameter(Mandatory=$true)]
-        $ASRDisk,
-        [Parameter(Mandatory=$true)]
-        $EFIPartition
-    )
-    
-    Write-Log "Configuring boot for ASR Windows..." -Level Info
-    
-    try {
-        $asrDriveLetter = $ASRDisk.DriveLetter
-        $efiDriveLetter = if ($EFIPartition.DriveLetter) { $EFIPartition.DriveLetter } else { "S" }
-        
-        # Run bcdboot to create boot files
-        Write-Log "Running bcdboot from ${asrDriveLetter}:\Windows to ${efiDriveLetter}:" -Level Info
-        
-        $bcdbootCmd = "bcdboot ${asrDriveLetter}:\Windows /s ${efiDriveLetter}: /f UEFI"
-        Write-Log "Executing: $bcdbootCmd" -Level Info
-        
-        $result = Invoke-Expression $bcdbootCmd 2>&1
-        $resultString = if ($result) { $result -join "`n" } else { "No output" }
-        
-        if ($LASTEXITCODE -eq 0 -or $resultString -like "*successfully*") {
-            Write-Log "Boot files created successfully" -Level Success
-            Write-Log "Output: $resultString" -Level Info
-            
-            # Verify boot files were created
-            $bootFilePath = "${efiDriveLetter}:\EFI\Microsoft\Boot\BCD"
-            if (Test-Path $bootFilePath) {
-                Write-Log "Verified: Boot files exist at $bootFilePath" -Level Success
-                return $true
-            } else {
-                Write-Log "Warning: Could not verify boot files at $bootFilePath" -Level Warning
-                # Still return true as bcdboot reported success
-                return $true
-            }
+# Check all possible drive letters
+$drives = Get-PSDrive -PSProvider FileSystem | Where-Object {$_.Name -match '^[A-Z]$'}
+
+foreach ($drive in $drives) {
+    $testPath = "$($drive.Name):\Windows\System32\ntoskrnl.exe"
+    if (Test-Path $testPath) {
+        # Get the actual partition size, not the used space
+        $partition = Get-Partition | Where-Object {$_.DriveLetter -eq $drive.Name} | Select-Object -First 1
+        if ($partition) {
+            $sizeGB = [math]::Round($partition.Size/1GB, 2)
         } else {
-            Write-Log "bcdboot failed with exit code: $LASTEXITCODE" -Level Error
-            Write-Log "Output: $resultString" -Level Error
-            return $false
+            # Fallback to volume size if partition info not available
+            $volume = Get-Volume -DriveLetter $drive.Name -ErrorAction SilentlyContinue
+            $sizeGB = if ($volume) { [math]::Round($volume.Size/1GB, 2) } else { 0 }
         }
         
-    } catch {
-        Write-Log "Error configuring boot: $_" -Level Error
-        return $false
+        Write-Host "  Found Windows on $($drive.Name): drive (Partition Size: $sizeGB GB)" -ForegroundColor Green
+        $windowsFound += @{
+            Drive = $drive.Name
+            Size = $sizeGB
+        }
     }
 }
 
-# Function to save configuration status
-function Save-ConfigurationStatus {
-    param(
-        [bool]$Success,
-        [string]$ASRDriveLetter = "",
-        [string]$ErrorMessage = ""
-    )
-    
-    $config = @{
-        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        Success = $Success
-        Status = if ($Success) { "Configured" } else { "Failed" }
-        ASRDriveLetter = $ASRDriveLetter
-        ComputerName = $env:COMPUTERNAME
-        RunAsSystem = Test-RunningAsSystem
-        RunFromTask = $RunningFromTask
-        ErrorMessage = $ErrorMessage
-        LogPath = $LogPath
-    }
-    
-    $configPath = "C:\ASRBootConfig.json"
-    $config | ConvertTo-Json | Out-File -FilePath $configPath -Force
-    
-    Write-Log "Configuration status saved to $configPath" -Level Info
-    
-    return $config
+if ($windowsFound.Count -eq 0) {
+    Write-Host "ERROR: No Windows installations found!" -ForegroundColor Red
+    exit 1
 }
 
-# Main execution
-try {
-    Write-Log "=========================================" -Level Info
-    Write-Log "ASR Boot Configuration Script v2.1" -Level Info
-    Write-Log "=========================================" -Level Info
-    Write-Log "Computer: $env:COMPUTERNAME" -Level Info
-    Write-Log "User: $env:USERNAME" -Level Info
-    Write-Log "Running as SYSTEM: $(Test-RunningAsSystem)" -Level Info
-    Write-Log "Running from Task: $RunningFromTask" -Level Info
-    Write-Log "Script Parameters: NoReboot=$NoReboot, ForceReboot=$ForceReboot" -Level Info
+# Select the Windows installation on the LARGEST partition (this will be the ASR Windows)
+$asrWindows = $windowsFound | Sort-Object Size -Descending | Select-Object -First 1
+
+Write-Host "`nSelecting Windows on the largest partition..." -ForegroundColor Yellow
+Write-Host "  Selected: $($asrWindows.Drive): drive with $($asrWindows.Size) GB partition" -ForegroundColor Green
+
+# Verify it's not the boot proxy Windows (should be much larger than the 127GB boot proxy disk)
+if ($asrWindows.Size -lt 200) {
+    Write-Host "WARNING: Selected Windows is on a small partition ($($asrWindows.Size) GB)" -ForegroundColor Yellow
+    Write-Host "This might be the wrong Windows installation!" -ForegroundColor Yellow
+}
+
+$asrDrive = $asrWindows.Drive
+Write-Host "`nSelected ASR Windows on ${asrDrive}: drive" -ForegroundColor Green
+
+# FORCE METHOD 1: Overwrite all boot files (BOTH Legacy and UEFI)
+Write-Host "`nMethod 1: Overwriting boot files with ASR Windows..." -ForegroundColor Yellow
+
+# Mount EFI partition first
+Write-Host "  Mounting EFI partition..." -ForegroundColor Gray
+& cmd /c "mountvol S: /S 2>&1" | Out-Null
+
+# Update BOTH Legacy (C:) and UEFI (S:) boot files
+Write-Host "  Updating Legacy BIOS boot files on C:..." -ForegroundColor Gray
+$result = & cmd /c "bcdboot ${asrDrive}:\Windows /s C: /f BIOS 2>&1"
+Write-Host "    $result"
+
+Write-Host "  Updating UEFI boot files on S:..." -ForegroundColor Gray
+$result = & cmd /c "bcdboot ${asrDrive}:\Windows /s S: /f UEFI 2>&1"
+Write-Host "    $result"
+
+Write-Host "  Updating ALL boot files (both BIOS and UEFI)..." -ForegroundColor Gray
+$result = & cmd /c "bcdboot ${asrDrive}:\Windows /s C: /f ALL 2>&1"
+Write-Host "    $result"
+
+# FORCE METHOD 2: Modify ALL boot entries in BOTH BCDs
+Write-Host "`nMethod 2: Forcing ALL boot entries to ASR Windows in both BCDs..." -ForegroundColor Yellow
+
+# Update Legacy BCD (C:\Boot\BCD)
+Write-Host "  Updating Legacy BCD entries..." -ForegroundColor Gray
+$bootEntries = @("{current}", "{default}", "{bootmgr}")
+foreach ($entry in $bootEntries) {
+    & cmd /c "bcdedit /set $entry device partition=${asrDrive}: 2>&1" | Out-Null
+    & cmd /c "bcdedit /set $entry osdevice partition=${asrDrive}: 2>&1" | Out-Null
+    & cmd /c "bcdedit /set $entry path \Windows\system32\boot\winload.efi 2>&1" | Out-Null
+    & cmd /c "bcdedit /set $entry systemroot \Windows 2>&1" | Out-Null
+}
+
+# Update UEFI BCD (S:\EFI\Microsoft\Boot\BCD)
+if (Test-Path "S:\EFI\Microsoft\Boot\BCD") {
+    Write-Host "  Updating UEFI BCD entries..." -ForegroundColor Gray
+    & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {default} device partition=${asrDrive}: 2>&1" | Out-Null
+    & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {default} osdevice partition=${asrDrive}: 2>&1" | Out-Null
+    & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {default} path \Windows\system32\boot\winload.efi 2>&1" | Out-Null
+    & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {default} systemroot \Windows 2>&1" | Out-Null
+    & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {default} description `"ASR Windows Server`" 2>&1" | Out-Null
     
-    # Check if running as SYSTEM and not from a scheduled task
-    if ((Test-RunningAsSystem) -and !$RunningFromTask) {
-        # Handle SYSTEM context by creating scheduled task
-        $handled = Handle-SystemContext
-        if ($handled) {
-            Write-Log "Configuration delegated to scheduled task successfully" -Level Success
-            exit 0
-        } else {
-            Write-Log "Failed to handle SYSTEM context via scheduled task" -Level Error
-            exit 1
-        }
+    # Also update bootmgr in EFI
+    & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {bootmgr} device partition=${asrDrive}: 2>&1" | Out-Null
+    & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {bootmgr} path \EFI\Microsoft\Boot\bootmgfw.efi 2>&1" | Out-Null
+}
+
+# FORCE METHOD 3: Delete and recreate BCD
+Write-Host "`nMethod 3: Nuclear option - recreating BCD..." -ForegroundColor Yellow
+& cmd /c "bcdedit /timeout 0 2>&1" | Out-Null
+& cmd /c "del C:\Boot\BCD /f 2>&1" | Out-Null
+& cmd /c "bcdboot ${asrDrive}:\Windows /s C: /f ALL 2>&1" | Out-Null
+& cmd /c "bcdedit /set {default} description `"ASR Windows Server`" 2>&1" | Out-Null
+
+# FORCE METHOD 4: Create a new boot entry and make it default
+Write-Host "`nMethod 4: Creating new boot entry..." -ForegroundColor Yellow
+$tempFile = [System.IO.Path]::GetTempFileName()
+& cmd /c "bcdedit /copy {bootmgr} /d `"ASR Windows Server`" > `"$tempFile`" 2>&1"
+$output = Get-Content $tempFile -Raw
+Remove-Item $tempFile -Force
+
+if ($output -match '\{([a-f0-9\-]+)\}') {
+    $guid = "{$($matches[1])}"
+    Write-Host "  Created entry: $guid" -ForegroundColor Green
+    
+    & cmd /c "bcdedit /set $guid device partition=${asrDrive}: 2>&1" | Out-Null
+    & cmd /c "bcdedit /set $guid osdevice partition=${asrDrive}: 2>&1" | Out-Null
+    & cmd /c "bcdedit /set $guid path \Windows\system32\winload.efi 2>&1" | Out-Null
+    & cmd /c "bcdedit /set $guid systemroot \Windows 2>&1" | Out-Null
+    
+    # Try both ways to set as default
+    & cmd /c "bcdedit /default $guid 2>&1" | Out-Null
+    & cmd /c "bcdedit /set {fwbootmgr} default $guid 2>&1" | Out-Null
+    & cmd /c "bcdedit /set {fwbootmgr} displayorder $guid /addfirst 2>&1" | Out-Null
+    
+    Write-Host "  Set as default boot entry" -ForegroundColor Green
+}
+
+# FORCE METHOD 5: Copy ASR boot files directly over the proxy boot files
+Write-Host "`nMethod 5: Copying ASR boot files over proxy boot files..." -ForegroundColor Yellow
+Write-Host "  This ensures the system has no choice but to boot ASR Windows" -ForegroundColor Gray
+
+# Copy the ASR bootmgr and Boot folder to C:
+if (Test-Path "${asrDrive}:\bootmgr") {
+    Copy-Item "${asrDrive}:\bootmgr" "C:\bootmgr" -Force
+    Write-Host "  Copied ASR bootmgr to C:" -ForegroundColor Green
+}
+
+if (Test-Path "${asrDrive}:\Boot") {
+    # Backup existing Boot folder
+    if (Test-Path "C:\Boot.proxy") {
+        Remove-Item "C:\Boot.proxy" -Recurse -Force
     }
+    Rename-Item "C:\Boot" "C:\Boot.proxy" -ErrorAction SilentlyContinue
     
-    # If we get here, we're either running as a user or from the scheduled task
-    Write-Log "Proceeding with boot configuration..." -Level Info
-    
-    # Step 1: Initialize disks
-    if (!(Initialize-Disks)) {
-        throw "Failed to initialize disks"
+    # Copy ASR Boot folder
+    Copy-Item "${asrDrive}:\Boot" "C:\Boot" -Recurse -Force
+    Write-Host "  Copied ASR Boot folder to C:" -ForegroundColor Green
+}
+
+# Copy EFI boot files
+if (Test-Path "C:\EFI\Microsoft\Boot") {
+    # Backup existing EFI boot
+    if (Test-Path "C:\EFI\Microsoft\Boot.proxy") {
+        Remove-Item "C:\EFI\Microsoft\Boot.proxy" -Recurse -Force
     }
+    Rename-Item "C:\EFI\Microsoft\Boot" "C:\EFI\Microsoft\Boot.proxy" -ErrorAction SilentlyContinue
     
-    # Step 2: Find ASR Windows
-    $asrDisk = Find-ASRWindows
-    if (!$asrDisk) {
-        throw "No ASR Windows installation found"
+    # Copy ASR EFI boot files
+    if (Test-Path "${asrDrive}:\EFI\Microsoft\Boot") {
+        Copy-Item "${asrDrive}:\EFI\Microsoft\Boot" "C:\EFI\Microsoft\Boot" -Recurse -Force
+        Write-Host "  Copied ASR EFI boot files to C:" -ForegroundColor Green
     }
+}
+
+# Final aggressive approach: Update the BCD store directly
+Write-Host "`nFinal step: Forcing BCD to point to ASR Windows..." -ForegroundColor Yellow
+& cmd /c "bcdedit /set {current} device partition=${asrDrive}: 2>&1" | Out-Null
+& cmd /c "bcdedit /set {current} osdevice partition=${asrDrive}: 2>&1" | Out-Null
+& cmd /c "bcdedit /set {default} device partition=${asrDrive}: 2>&1" | Out-Null
+& cmd /c "bcdedit /set {default} osdevice partition=${asrDrive}: 2>&1" | Out-Null
+
+# Show final configuration
+Write-Host "`n========================================" -ForegroundColor Cyan
+Write-Host "VERIFICATION" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+
+Write-Host "`nLegacy BCD Configuration:" -ForegroundColor Yellow
+Write-Host "Current boot configuration:" -ForegroundColor Gray
+& cmd /c "bcdedit /enum {current} | findstr /i `"device osdevice description`""
+
+Write-Host "`nDefault boot configuration:" -ForegroundColor Gray
+& cmd /c "bcdedit /enum {default} | findstr /i `"device osdevice description`""
+
+Write-Host "`nUEFI BCD Configuration (EFI Partition):" -ForegroundColor Yellow
+if (Test-Path "S:\EFI\Microsoft\Boot\BCD") {
+    & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /enum {default} | findstr /i `"device osdevice description`""
+} else {
+    Write-Host "  EFI BCD not found" -ForegroundColor Red
+}
+
+Write-Host "`nAll Windows Boot Manager entries:" -ForegroundColor Yellow
+& cmd /c "bcdedit /enum firmware | findstr /i `"description`""
+
+# Save configuration
+$config = @{
+    Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    ASRDrive = $asrDrive
+    Version = "v8"
+    Success = $true
+}
+$config | ConvertTo-Json | Out-File "C:\ASRBootConfig.json" -Force
+
+Write-Host "`n========================================" -ForegroundColor Green
+Write-Host "BOOT CONFIGURATION FORCED!" -ForegroundColor Green
+Write-Host "========================================" -ForegroundColor Green
+Write-Host "ASR Windows: ${asrDrive}:\Windows" -ForegroundColor Cyan
+
+# Handle reboot
+if (-not $NoReboot) {
+    # Detect if running in automation (as SYSTEM or via Run Command)
+    $isAutomated = ($env:USERNAME -eq "SYSTEM") -or ($env:COMPUTERNAME -match "bootproxy")
     
-    # Step 3: Prepare EFI partition
-    $efiPartition = Prepare-EFIPartition -ASRDisk $asrDisk
-    if (!$efiPartition) {
-        throw "Failed to prepare EFI partition"
-    }
-    
-    # Step 4: Configure boot
-    $bootConfigured = Set-BootConfiguration -ASRDisk $asrDisk -EFIPartition $efiPartition
-    if (!$bootConfigured) {
-        throw "Failed to configure boot"
-    }
-    
-    # Step 5: Save configuration status
-    $config = Save-ConfigurationStatus -Success $true -ASRDriveLetter $asrDisk.DriveLetter
-    
-    Write-Log "=========================================" -Level Info
-    Write-Log "CONFIGURATION COMPLETED SUCCESSFULLY" -Level Success
-    Write-Log "=========================================" -Level Info
-    Write-Log "ASR Windows: Drive $($asrDisk.DriveLetter)" -Level Success
-    Write-Log "Boot files configured on EFI partition" -Level Success
-    
-    # Handle reboot - ONLY auto-reboot when running as SYSTEM from scheduled task
-    if ($RunningFromTask) {
-        Write-Log "Configuration complete - returning to SYSTEM context for reboot" -Level Info
-        # Create success marker
-        "Boot configuration completed at $(Get-Date)" | Out-File -FilePath "C:\temp\ASRBootSuccess.txt" -Force
-    } elseif (Test-RunningAsSystem) {
-        # Running as SYSTEM but NOT from task (shouldn't happen with our flow, but be safe)
-        Write-Log "Running as SYSTEM - configuration complete" -Level Info
-        Write-Log "Manual reboot required" -Level Warning
-    } elseif ($ForceReboot) {
-        Write-Log "ForceReboot specified - initiating system reboot in 10 seconds..." -Level Warning
-        Write-Log "To cancel reboot, run: shutdown /a" -Level Warning
-        
-        # Create success marker before reboot
-        "Boot configuration completed at $(Get-Date)" | Out-File -FilePath "C:\temp\ASRBootSuccess.txt" -Force
-        
-        shutdown /r /t 10 /f /c "ASR Boot Configuration Complete - Rebooting to apply changes"
-        
-        Write-Log "Reboot scheduled" -Level Success
-    } elseif (!$NoReboot) {
-        # Interactive session - DO NOT auto-reboot
-        Write-Log "=========================================" -Level Info
-        Write-Log "Configuration complete!" -Level Success
-        Write-Log "Please reboot the system to boot from ASR disk" -Level Warning
-        Write-Log "=========================================" -Level Info
-        
-        Write-Host "`n" -ForegroundColor Yellow
-        Write-Host "IMPORTANT: Reboot required to complete configuration" -ForegroundColor Yellow -BackgroundColor DarkRed
-        Write-Host "Run 'Restart-Computer' when ready" -ForegroundColor Yellow
+    if ($isAutomated) {
+        Write-Host "`nAutomated execution detected - rebooting in 10 seconds..." -ForegroundColor Yellow
+        Write-Host "VM will boot into ASR Windows Server after restart" -ForegroundColor Green
+        Start-Sleep -Seconds 10
+        Restart-Computer -Force
     } else {
-        Write-Log "NoReboot specified - manual reboot required" -Level Warning
-        Write-Log "Configuration complete" -Level Success
+        Write-Host "`nManual execution - please reboot when ready:" -ForegroundColor Yellow
+        Write-Host "  shutdown /r /t 0" -ForegroundColor Cyan
     }
-    
-} catch {
-    $errorMsg = $_.Exception.Message
-    Write-Log "CONFIGURATION FAILED: $errorMsg" -Level Error
-    Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Level Error
-    
-    # Save failure status
-    Save-ConfigurationStatus -Success $false -ErrorMessage $errorMsg
-    
-    # If running interactively, provide troubleshooting steps
-    if (!(Test-RunningAsSystem) -and !$RunningFromTask) {
-        Write-Log "" -Level Info
-        Write-Log "TROUBLESHOOTING STEPS:" -Level Warning
-        Write-Log "1. Check disk status: Get-Disk | Format-Table" -Level Info
-        Write-Log "2. Verify Windows installations: Get-Volume | Where DriveLetter" -Level Info
-        Write-Log "3. Review log file: Get-Content $LogPath" -Level Info
-        Write-Log "4. Run with -Verbose flag for more details" -Level Info
-    }
-    
-    # Don't throw if running as SYSTEM or from task (to avoid RunCommand failures)
-    if (!(Test-RunningAsSystem) -and !$RunningFromTask) {
-        throw
-    }
-} finally {
-    # Ensure log is saved
-    if ($script:LogMessages.Count -gt 0) {
-        $script:LogMessages | Out-File -FilePath $LogPath -Force
-    }
-    
-    Write-Log "Log file saved to: $LogPath" -Level Info
-    
-    # Create summary file for easy checking
-    $summaryPath = "C:\temp\ASRBootSummary.txt"
-    $summary = @"
-ASR Boot Configuration Summary
-==============================
-Timestamp: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-Status: $(if (!$script:HasErrors) { "SUCCESS" } else { "FAILED" })
-Computer: $env:COMPUTERNAME
-User: $env:USERNAME
-Running from Task: $RunningFromTask
-Log File: $LogPath
-
-$(if ($asrDisk) { "ASR Windows Found: Drive $($asrDisk.DriveLetter)" } else { "ASR Windows: Not Found" })
-$(if ($efiPartition) { "EFI Partition: Configured" } else { "EFI Partition: Not Configured" })
-$(if ($bootConfigured) { "Boot Configuration: Complete" } else { "Boot Configuration: Failed" })
-
-Next Step: $(if (!$script:HasErrors -and !$NoReboot) { "System will reboot automatically" } elseif (!$script:HasErrors) { "Manual reboot required" } else { "Review errors and retry" })
-"@
-    
-    $summary | Out-File -FilePath $summaryPath -Force
-    
-    if ($Verbose) {
-        Write-Host "`nSummary saved to: $summaryPath" -ForegroundColor Cyan
-        Get-Content $summaryPath
-    }
+} else {
+    Write-Host "`nReboot skipped (NoReboot parameter specified)" -ForegroundColor Yellow
+    Write-Host "Please reboot manually to apply changes: shutdown /r /t 0" -ForegroundColor Cyan
 }
