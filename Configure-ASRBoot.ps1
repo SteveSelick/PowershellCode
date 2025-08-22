@@ -1,346 +1,353 @@
-# Configure-ASRBoot.ps1 (v8)
-# Aggressive script to force boot to ASR Windows
-# Run this INSIDE the bootproxy VM
+# Configure-ASRBoot-Enhanced.ps1
+# Enhanced script with more aggressive UEFI boot configuration
+# Version 9 - Focused on Azure Gen2 VMs with UEFI
 
 param(
-    [switch]$NoReboot
+    [switch]$NoReboot,
+    [switch]$ForceUEFI
 )
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "ASR BOOT CONFIGURATION SCRIPT (v8)" -ForegroundColor Cyan
+Write-Host "ASR BOOT CONFIGURATION SCRIPT (v9 ENHANCED)" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "Focus: Azure Gen2 UEFI Boot Fix" -ForegroundColor Yellow
 
-# Create temp directory if it doesn't exist
-if (!(Test-Path "C:\temp")) {
-    New-Item -ItemType Directory -Path "C:\temp" -Force | Out-Null
-}
-
-# Rename the current C: drive volume label to "BootProxy" for clarity
-# This is the proxy Windows that we're currently running in
-Write-Host "`nRenaming current boot volume to 'BootProxy'..." -ForegroundColor Yellow
-try {
-    $drive = Get-WmiObject -Class Win32_Volume -Filter "DriveLetter='C:'"
-    # Only rename if it's the small boot proxy disk (< 200GB)
-    if ($drive.Capacity -lt 200GB) {
-        $drive.Label = "BootProxy"
-        $drive.Put() | Out-Null
-        Write-Host "  Current boot drive renamed to 'BootProxy'" -ForegroundColor Green
-    } else {
-        Write-Host "  Current C: drive is large ($([math]::Round($drive.Capacity/1GB))GB), skipping rename" -ForegroundColor Yellow
-    }
-} catch {
-    # Alternative method using label command
-    $vol = Get-Volume -DriveLetter C -ErrorAction SilentlyContinue
-    if ($vol -and $vol.Size -lt 200GB) {
-        & cmd /c "label C: BootProxy" 2>&1 | Out-Null
-        Write-Host "  Current boot drive renamed to 'BootProxy'" -ForegroundColor Green
-    }
-}
-
-# Find all Windows installations
-Write-Host "`nStep 1: Finding and initializing ALL disks..." -ForegroundColor Yellow
-
-# First, bring all disks online
-$allDisks = Get-Disk
-foreach ($disk in $allDisks) {
-    if ($disk.OperationalStatus -eq 'Offline') {
-        Write-Host "  Bringing Disk $($disk.Number) online..." -ForegroundColor Gray
-        Set-Disk -Number $disk.Number -IsOffline $false
-    }
-}
-
-# Check ALL disks and ALL partitions
-Write-Host "`nChecking ALL disks for Windows installations..." -ForegroundColor Yellow
-
-foreach ($disk in $allDisks) {
-    Write-Host "`n  Disk $($disk.Number) - Size: $([math]::Round($disk.Size/1GB))GB" -ForegroundColor Cyan
-    
-    # Get all partitions on this disk
-    $partitions = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue
-    
-    if ($partitions) {
-        Write-Host "  Partitions on Disk $($disk.Number):" -ForegroundColor Gray
-        foreach ($p in $partitions) {
-            $sizeGB = [math]::Round($p.Size/1GB, 2)
-            $letter = if ($p.DriveLetter) { "$($p.DriveLetter):" } else { "No Letter" }
-            Write-Host "    Partition $($p.PartitionNumber): $sizeGB GB, Type: $($p.Type), Drive: $letter" -ForegroundColor Gray
-        }
-        
-        # Check each partition for Windows
-        foreach ($partition in $partitions) {
-            # Skip very small partitions (< 10GB can't have Windows)
-            if ($partition.Size -lt 10GB) {
-                continue
-            }
-            
-            if ($partition.DriveLetter) {
-                # Check existing drive letter for Windows
-                $existingLetter = $partition.DriveLetter
-                if (Test-Path "${existingLetter}:\Windows\System32\ntoskrnl.exe") {
-                    Write-Host "    [FOUND] Windows on Disk $($disk.Number), Partition $($partition.PartitionNumber), Drive ${existingLetter}:" -ForegroundColor Green
-                }
-            } else {
-                # Partition has no letter, assign one and check
-                $usedLetters = (Get-PSDrive -PSProvider FileSystem).Name
-                $availableLetters = 'GHIJKLMNOPQRSTUVWXYZ'.ToCharArray() | Where-Object {$_ -notin $usedLetters}
-                
-                if ($availableLetters.Count -gt 0) {
-                    $newLetter = $availableLetters[0]
-                    Write-Host "    Assigning drive letter $newLetter to Disk $($disk.Number), Partition $($partition.PartitionNumber) (Size: $([math]::Round($partition.Size/1GB))GB)" -ForegroundColor Yellow
-                    
-                    # Use diskpart to assign letter
-                    $diskpartScript = @"
-select disk $($disk.Number)
-select partition $($partition.PartitionNumber)
-assign letter=$newLetter
-"@
-                    $diskpartScript | Out-File "C:\temp\assignletter.txt" -Encoding ASCII -Force
-                    $null = diskpart /s "C:\temp\assignletter.txt" 2>&1
-                    Remove-Item "C:\temp\assignletter.txt" -Force -ErrorAction SilentlyContinue
-                    
-                    Start-Sleep -Seconds 2
-                    
-                    # Check for Windows
-                    if (Test-Path "${newLetter}:\Windows\System32\ntoskrnl.exe") {
-                        Write-Host "    [FOUND] Windows on Disk $($disk.Number), Partition $($partition.PartitionNumber), Drive ${newLetter}:" -ForegroundColor Green
-                    } else {
-                        # No Windows, remove the drive letter to keep things clean
-                        $diskpartScript = @"
-select disk $($disk.Number)
-select partition $($partition.PartitionNumber)
-remove letter=$newLetter
-"@
-                        $diskpartScript | Out-File "C:\temp\removeletter.txt" -Encoding ASCII -Force
-                        $null = diskpart /s "C:\temp\removeletter.txt" 2>&1
-                        Remove-Item "C:\temp\removeletter.txt" -Force -ErrorAction SilentlyContinue
-                    }
-                }
-            }
-        }
-    }
-}
-
-Write-Host "`nStep 2: Searching for Windows installations..." -ForegroundColor Yellow
-
-$windowsFound = @()
-
-# Check all possible drive letters
-$drives = Get-PSDrive -PSProvider FileSystem | Where-Object {$_.Name -match '^[A-Z]$'}
-
-foreach ($drive in $drives) {
-    $testPath = "$($drive.Name):\Windows\System32\ntoskrnl.exe"
-    if (Test-Path $testPath) {
-        # Get the actual partition size, not the used space
-        $partition = Get-Partition | Where-Object {$_.DriveLetter -eq $drive.Name} | Select-Object -First 1
-        if ($partition) {
-            $sizeGB = [math]::Round($partition.Size/1GB, 2)
-        } else {
-            # Fallback to volume size if partition info not available
-            $volume = Get-Volume -DriveLetter $drive.Name -ErrorAction SilentlyContinue
-            $sizeGB = if ($volume) { [math]::Round($volume.Size/1GB, 2) } else { 0 }
-        }
-        
-        Write-Host "  Found Windows on $($drive.Name): drive (Partition Size: $sizeGB GB)" -ForegroundColor Green
-        $windowsFound += @{
-            Drive = $drive.Name
-            Size = $sizeGB
-        }
-    }
-}
-
-if ($windowsFound.Count -eq 0) {
-    Write-Host "ERROR: No Windows installations found!" -ForegroundColor Red
+# Check if running as admin
+if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+    Write-Host "ERROR: This script must be run as Administrator!" -ForegroundColor Red
     exit 1
 }
 
-# Select the Windows installation on the LARGEST partition (this will be the ASR Windows)
-$asrWindows = $windowsFound | Sort-Object Size -Descending | Select-Object -First 1
-
-Write-Host "`nSelecting Windows on the largest partition..." -ForegroundColor Yellow
-Write-Host "  Selected: $($asrWindows.Drive): drive with $($asrWindows.Size) GB partition" -ForegroundColor Green
-
-# Verify it's not the boot proxy Windows (should be much larger than the 127GB boot proxy disk)
-if ($asrWindows.Size -lt 200) {
-    Write-Host "WARNING: Selected Windows is on a small partition ($($asrWindows.Size) GB)" -ForegroundColor Yellow
-    Write-Host "This might be the wrong Windows installation!" -ForegroundColor Yellow
+# Create temp and log directory
+$logDir = "C:\temp"
+if (!(Test-Path $logDir)) {
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 }
 
+$logFile = "$logDir\ASRBootConfig_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+function Write-Log {
+    param($Message, $Color = "White")
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$timestamp - $Message" | Out-File -FilePath $logFile -Append
+    Write-Host $Message -ForegroundColor $Color
+}
+
+Write-Log "Starting ASR Boot Configuration" "Cyan"
+
+# Step 1: Identify boot type (UEFI vs Legacy)
+Write-Log "`nStep 1: Detecting boot type..." "Yellow"
+$bootType = "Unknown"
+try {
+    $firmware = Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control" -Name PEFirmwareType -ErrorAction SilentlyContinue
+    if ($firmware.PEFirmwareType -eq 2) {
+        $bootType = "UEFI"
+        Write-Log "  Boot Type: UEFI (Gen2 VM)" "Green"
+    } elseif ($firmware.PEFirmwareType -eq 1) {
+        $bootType = "BIOS"
+        Write-Log "  Boot Type: Legacy BIOS (Gen1 VM)" "Yellow"
+    }
+} catch {
+    Write-Log "  Could not determine boot type, assuming UEFI for Azure" "Yellow"
+    $bootType = "UEFI"
+}
+
+# Step 2: Bring all disks online and initialize
+Write-Log "`nStep 2: Initializing all disks..." "Yellow"
+$allDisks = Get-Disk
+foreach ($disk in $allDisks) {
+    if ($disk.OperationalStatus -eq 'Offline') {
+        Write-Log "  Bringing Disk $($disk.Number) online..." "Gray"
+        Set-Disk -Number $disk.Number -IsOffline $false -ErrorAction SilentlyContinue
+    }
+    if ($disk.IsReadOnly) {
+        Write-Log "  Setting Disk $($disk.Number) to read-write..." "Gray"
+        Set-Disk -Number $disk.Number -IsReadOnly $false -ErrorAction SilentlyContinue
+    }
+}
+
+# Step 3: Find ALL Windows installations
+Write-Log "`nStep 3: Searching for Windows installations..." "Yellow"
+$windowsInstallations = @()
+
+# First assign drive letters to all large partitions
+$partitions = Get-Partition | Where-Object { $_.Size -gt 10GB }
+foreach ($partition in $partitions) {
+    if (-not $partition.DriveLetter) {
+        $usedLetters = (Get-Partition | Where-Object {$_.DriveLetter} | Select-Object -ExpandProperty DriveLetter)
+        $availableLetters = 70..90 | ForEach-Object { [char]$_ } | Where-Object { $_ -notin $usedLetters -and $_ -ne 'C' }
+        
+        if ($availableLetters.Count -gt 0) {
+            $newLetter = $availableLetters[0]
+            Write-Log "  Assigning drive letter $newLetter to partition (Size: $([math]::Round($partition.Size/1GB))GB)" "Gray"
+            Set-Partition -InputObject $partition -NewDriveLetter $newLetter -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# Now search for Windows
+Start-Sleep -Seconds 2
+$drives = Get-PSDrive -PSProvider FileSystem | Where-Object {$_.Name -match '^[A-Z]$'}
+foreach ($drive in $drives) {
+    $testPath = "$($drive.Name):\Windows\System32\ntoskrnl.exe"
+    if (Test-Path $testPath) {
+        $partition = Get-Partition | Where-Object {$_.DriveLetter -eq $drive.Name} | Select-Object -First 1
+        $sizeGB = [math]::Round($partition.Size/1GB, 2)
+        
+        $winInfo = @{
+            Drive = $drive.Name
+            Size = $sizeGB
+            DiskNumber = $partition.DiskNumber
+            PartitionNumber = $partition.PartitionNumber
+        }
+        
+        Write-Log "  Found Windows on $($drive.Name): drive (Size: $sizeGB GB, Disk: $($partition.DiskNumber))" "Green"
+        $windowsInstallations += $winInfo
+    }
+}
+
+if ($windowsInstallations.Count -eq 0) {
+    Write-Log "ERROR: No Windows installations found!" "Red"
+    exit 1
+}
+
+# Select the Windows on the LARGEST partition (ASR disk)
+$asrWindows = $windowsInstallations | Sort-Object Size -Descending | Select-Object -First 1
 $asrDrive = $asrWindows.Drive
-Write-Host "`nSelected ASR Windows on ${asrDrive}: drive" -ForegroundColor Green
 
-# FORCE METHOD 1: Overwrite all boot files (BOTH Legacy and UEFI)
-Write-Host "`nMethod 1: Overwriting boot files with ASR Windows..." -ForegroundColor Yellow
+Write-Log "`nSelected ASR Windows: $($asrDrive): drive ($($asrWindows.Size) GB)" "Green"
 
-# Mount EFI partition first
-Write-Host "  Mounting EFI partition..." -ForegroundColor Gray
-& cmd /c "mountvol S: /S 2>&1" | Out-Null
+# Step 4: Mount and prepare EFI partition
+Write-Log "`nStep 4: Preparing EFI partition..." "Yellow"
 
-# Update BOTH Legacy (C:) and UEFI (S:) boot files
-Write-Host "  Updating Legacy BIOS boot files on C:..." -ForegroundColor Gray
-$result = & cmd /c "bcdboot ${asrDrive}:\Windows /s C: /f BIOS 2>&1"
-Write-Host "    $result"
+# Find EFI partition
+$efiPartition = Get-Partition | Where-Object { $_.GptType -eq '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' } | Select-Object -First 1
 
-Write-Host "  Updating UEFI boot files on S:..." -ForegroundColor Gray
-$result = & cmd /c "bcdboot ${asrDrive}:\Windows /s S: /f UEFI 2>&1"
-Write-Host "    $result"
+if ($efiPartition) {
+    Write-Log "  Found EFI partition on Disk $($efiPartition.DiskNumber), Partition $($efiPartition.PartitionNumber)" "Green"
+    
+    # Assign letter S: to EFI partition if not already assigned
+    if (-not $efiPartition.DriveLetter) {
+        Write-Log "  Mounting EFI partition as S:..." "Gray"
+        $diskpartScript = @"
+select disk $($efiPartition.DiskNumber)
+select partition $($efiPartition.PartitionNumber)
+assign letter=S
+"@
+        $diskpartScript | Out-File "$logDir\mount_efi.txt" -Encoding ASCII -Force
+        $null = diskpart /s "$logDir\mount_efi.txt" 2>&1
+        Remove-Item "$logDir\mount_efi.txt" -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    } else {
+        $efiDrive = $efiPartition.DriveLetter
+        Write-Log "  EFI partition already mounted as ${efiDrive}:" "Gray"
+    }
+} else {
+    Write-Log "  WARNING: No EFI partition found - using mountvol" "Yellow"
+    & cmd /c "mountvol S: /S 2>&1" | Out-Null
+}
 
-Write-Host "  Updating ALL boot files (both BIOS and UEFI)..." -ForegroundColor Gray
-$result = & cmd /c "bcdboot ${asrDrive}:\Windows /s C: /f ALL 2>&1"
-Write-Host "    $result"
+# Step 5: AGGRESSIVE BCD CLEANUP
+Write-Log "`nStep 5: Cleaning up old boot entries..." "Yellow"
 
-# FORCE METHOD 2: Modify ALL boot entries in BOTH BCDs
-Write-Host "`nMethod 2: Forcing ALL boot entries to ASR Windows in both BCDs..." -ForegroundColor Yellow
+# Backup current BCD
+Write-Log "  Backing up current BCD..." "Gray"
+& cmd /c "bcdedit /export C:\temp\BCD_Backup_$(Get-Date -Format 'yyyyMMdd_HHmmss') 2>&1" | Out-Null
 
-# Update Legacy BCD (C:\Boot\BCD)
-Write-Host "  Updating Legacy BCD entries..." -ForegroundColor Gray
-$bootEntries = @("{current}", "{default}", "{bootmgr}")
-foreach ($entry in $bootEntries) {
+# Delete all non-current boot entries
+$bcdenum = & bcdedit /enum | Out-String
+$guidPattern = '\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}'
+$guids = [regex]::Matches($bcdenum, $guidPattern) | ForEach-Object { $_.Value } | Select-Object -Unique
+
+foreach ($guid in $guids) {
+    if ($guid -ne '{current}' -and $guid -ne '{default}' -and $guid -ne '{bootmgr}' -and $guid -ne '{fwbootmgr}') {
+        Write-Log "  Deleting boot entry: $guid" "Gray"
+        & cmd /c "bcdedit /delete $guid /f 2>&1" | Out-Null
+    }
+}
+
+# Step 6: NUCLEAR OPTION - Complete BCD rebuild
+Write-Log "`nStep 6: Rebuilding boot configuration from scratch..." "Yellow"
+
+if ($bootType -eq "UEFI" -or $ForceUEFI) {
+    Write-Log "  Rebuilding UEFI boot configuration..." "Yellow"
+    
+    # Delete old EFI boot files
+    if (Test-Path "S:\EFI\Microsoft\Boot") {
+        Write-Log "  Removing old EFI boot files..." "Gray"
+        Remove-Item "S:\EFI\Microsoft\Boot\*" -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    
+    # Rebuild EFI boot
+    Write-Log "  Creating new UEFI boot files from ASR Windows..." "Gray"
+    $result = & cmd /c "bcdboot ${asrDrive}:\Windows /s S: /f UEFI 2>&1"
+    Write-Log "    $result" "Gray"
+    
+    # Also update the system partition
+    Write-Log "  Updating system partition boot files..." "Gray"
+    $result = & cmd /c "bcdboot ${asrDrive}:\Windows /s C: /f ALL 2>&1"
+    Write-Log "    $result" "Gray"
+    
+    # Force UEFI entries
+    if (Test-Path "S:\EFI\Microsoft\Boot\BCD") {
+        Write-Log "  Forcing UEFI BCD entries to ASR Windows..." "Yellow"
+        
+        # Set default OS
+        & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {default} device partition=${asrDrive}: 2>&1" | Out-Null
+        & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {default} osdevice partition=${asrDrive}: 2>&1" | Out-Null
+        & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {default} path \Windows\system32\boot\winload.efi 2>&1" | Out-Null
+        & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {default} systemroot \Windows 2>&1" | Out-Null
+        & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {default} description `"ASR Production Windows`" 2>&1" | Out-Null
+        
+        # Set boot manager
+        & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {bootmgr} device partition=S: 2>&1" | Out-Null
+        & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {bootmgr} path \EFI\Microsoft\Boot\bootmgfw.efi 2>&1" | Out-Null
+        & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {bootmgr} description `"Windows Boot Manager`" 2>&1" | Out-Null
+        
+        # Set timeout to 0
+        & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /timeout 0 2>&1" | Out-Null
+    }
+    
+    # Create UEFI NVRAM entries
+    Write-Log "  Creating UEFI firmware boot entries..." "Yellow"
+    
+    # Try to create a new firmware application entry
+    $tempFile = [System.IO.Path]::GetTempFileName()
+    & cmd /c "bcdedit /create /d `"ASR Windows Boot Manager`" /application bootmgr > `"$tempFile`" 2>&1"
+    $output = Get-Content $tempFile -Raw
+    Remove-Item $tempFile -Force
+    
+    if ($output -match '\{([a-f0-9\-]+)\}') {
+        $newGuid = "{$($matches[1])}"
+        Write-Log "    Created firmware entry: $newGuid" "Green"
+        
+        & cmd /c "bcdedit /set $newGuid device partition=S: 2>&1" | Out-Null
+        & cmd /c "bcdedit /set $newGuid path \EFI\Microsoft\Boot\bootmgfw.efi 2>&1" | Out-Null
+        & cmd /c "bcdedit /set {fwbootmgr} displayorder $newGuid /addfirst 2>&1" | Out-Null
+        & cmd /c "bcdedit /set {fwbootmgr} default $newGuid 2>&1" | Out-Null
+    }
+}
+
+# Step 7: Update main BCD store
+Write-Log "`nStep 7: Updating main BCD store..." "Yellow"
+
+# Force all entries to point to ASR Windows
+$entries = @("{current}", "{default}")
+foreach ($entry in $entries) {
+    Write-Log "  Updating $entry..." "Gray"
     & cmd /c "bcdedit /set $entry device partition=${asrDrive}: 2>&1" | Out-Null
     & cmd /c "bcdedit /set $entry osdevice partition=${asrDrive}: 2>&1" | Out-Null
-    & cmd /c "bcdedit /set $entry path \Windows\system32\boot\winload.efi 2>&1" | Out-Null
     & cmd /c "bcdedit /set $entry systemroot \Windows 2>&1" | Out-Null
-}
-
-# Update UEFI BCD (S:\EFI\Microsoft\Boot\BCD)
-if (Test-Path "S:\EFI\Microsoft\Boot\BCD") {
-    Write-Host "  Updating UEFI BCD entries..." -ForegroundColor Gray
-    & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {default} device partition=${asrDrive}: 2>&1" | Out-Null
-    & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {default} osdevice partition=${asrDrive}: 2>&1" | Out-Null
-    & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {default} path \Windows\system32\boot\winload.efi 2>&1" | Out-Null
-    & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {default} systemroot \Windows 2>&1" | Out-Null
-    & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {default} description `"ASR Windows Server`" 2>&1" | Out-Null
     
-    # Also update bootmgr in EFI
-    & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {bootmgr} device partition=${asrDrive}: 2>&1" | Out-Null
-    & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /set {bootmgr} path \EFI\Microsoft\Boot\bootmgfw.efi 2>&1" | Out-Null
+    if ($bootType -eq "UEFI") {
+        & cmd /c "bcdedit /set $entry path \Windows\system32\boot\winload.efi 2>&1" | Out-Null
+    } else {
+        & cmd /c "bcdedit /set $entry path \Windows\system32\boot\winload.exe 2>&1" | Out-Null
+    }
 }
 
-# FORCE METHOD 3: Delete and recreate BCD
-Write-Host "`nMethod 3: Nuclear option - recreating BCD..." -ForegroundColor Yellow
+& cmd /c "bcdedit /set {default} description `"ASR Production Windows`" 2>&1" | Out-Null
 & cmd /c "bcdedit /timeout 0 2>&1" | Out-Null
-& cmd /c "del C:\Boot\BCD /f 2>&1" | Out-Null
-& cmd /c "bcdboot ${asrDrive}:\Windows /s C: /f ALL 2>&1" | Out-Null
-& cmd /c "bcdedit /set {default} description `"ASR Windows Server`" 2>&1" | Out-Null
 
-# FORCE METHOD 4: Create a new boot entry and make it default
-Write-Host "`nMethod 4: Creating new boot entry..." -ForegroundColor Yellow
-$tempFile = [System.IO.Path]::GetTempFileName()
-& cmd /c "bcdedit /copy {bootmgr} /d `"ASR Windows Server`" > `"$tempFile`" 2>&1"
-$output = Get-Content $tempFile -Raw
-Remove-Item $tempFile -Force
-
-if ($output -match '\{([a-f0-9\-]+)\}') {
-    $guid = "{$($matches[1])}"
-    Write-Host "  Created entry: $guid" -ForegroundColor Green
+# Step 8: Additional UEFI fixes for Azure
+if ($bootType -eq "UEFI") {
+    Write-Log "`nStep 8: Applying Azure-specific UEFI fixes..." "Yellow"
     
-    & cmd /c "bcdedit /set $guid device partition=${asrDrive}: 2>&1" | Out-Null
-    & cmd /c "bcdedit /set $guid osdevice partition=${asrDrive}: 2>&1" | Out-Null
-    & cmd /c "bcdedit /set $guid path \Windows\system32\winload.efi 2>&1" | Out-Null
-    & cmd /c "bcdedit /set $guid systemroot \Windows 2>&1" | Out-Null
-    
-    # Try both ways to set as default
-    & cmd /c "bcdedit /default $guid 2>&1" | Out-Null
-    & cmd /c "bcdedit /set {fwbootmgr} default $guid 2>&1" | Out-Null
-    & cmd /c "bcdedit /set {fwbootmgr} displayorder $guid /addfirst 2>&1" | Out-Null
-    
-    Write-Host "  Set as default boot entry" -ForegroundColor Green
-}
-
-# FORCE METHOD 5: Copy ASR boot files directly over the proxy boot files
-Write-Host "`nMethod 5: Copying ASR boot files over proxy boot files..." -ForegroundColor Yellow
-Write-Host "  This ensures the system has no choice but to boot ASR Windows" -ForegroundColor Gray
-
-# Copy the ASR bootmgr and Boot folder to C:
-if (Test-Path "${asrDrive}:\bootmgr") {
-    Copy-Item "${asrDrive}:\bootmgr" "C:\bootmgr" -Force
-    Write-Host "  Copied ASR bootmgr to C:" -ForegroundColor Green
-}
-
-if (Test-Path "${asrDrive}:\Boot") {
-    # Backup existing Boot folder
-    if (Test-Path "C:\Boot.proxy") {
-        Remove-Item "C:\Boot.proxy" -Recurse -Force
+    # Ensure boot files are in all possible locations
+    $efiLocations = @("S:", "C:")
+    foreach ($location in $efiLocations) {
+        if (Test-Path "$location\") {
+            Write-Log "  Copying boot files to $location..." "Gray"
+            & cmd /c "bcdboot ${asrDrive}:\Windows /s $location /f UEFI 2>&1" | Out-Null
+        }
     }
-    Rename-Item "C:\Boot" "C:\Boot.proxy" -ErrorAction SilentlyContinue
     
-    # Copy ASR Boot folder
-    Copy-Item "${asrDrive}:\Boot" "C:\Boot" -Recurse -Force
-    Write-Host "  Copied ASR Boot folder to C:" -ForegroundColor Green
+    # Fix boot order in firmware
+    Write-Log "  Fixing UEFI boot order..." "Gray"
+    & cmd /c "bcdedit /set {fwbootmgr} displayorder {bootmgr} /addfirst 2>&1" | Out-Null
+    & cmd /c "bcdedit /set {fwbootmgr} timeout 0 2>&1" | Out-Null
 }
 
-# Copy EFI boot files
-if (Test-Path "C:\EFI\Microsoft\Boot") {
-    # Backup existing EFI boot
-    if (Test-Path "C:\EFI\Microsoft\Boot.proxy") {
-        Remove-Item "C:\EFI\Microsoft\Boot.proxy" -Recurse -Force
-    }
-    Rename-Item "C:\EFI\Microsoft\Boot" "C:\EFI\Microsoft\Boot.proxy" -ErrorAction SilentlyContinue
-    
-    # Copy ASR EFI boot files
-    if (Test-Path "${asrDrive}:\EFI\Microsoft\Boot") {
-        Copy-Item "${asrDrive}:\EFI\Microsoft\Boot" "C:\EFI\Microsoft\Boot" -Recurse -Force
-        Write-Host "  Copied ASR EFI boot files to C:" -ForegroundColor Green
-    }
-}
+# Step 9: Verification
+Write-Log "`n========================================" "Cyan"
+Write-Log "VERIFICATION" "Cyan"
+Write-Log "========================================" "Cyan"
 
-# Final aggressive approach: Update the BCD store directly
-Write-Host "`nFinal step: Forcing BCD to point to ASR Windows..." -ForegroundColor Yellow
-& cmd /c "bcdedit /set {current} device partition=${asrDrive}: 2>&1" | Out-Null
-& cmd /c "bcdedit /set {current} osdevice partition=${asrDrive}: 2>&1" | Out-Null
-& cmd /c "bcdedit /set {default} device partition=${asrDrive}: 2>&1" | Out-Null
-& cmd /c "bcdedit /set {default} osdevice partition=${asrDrive}: 2>&1" | Out-Null
+Write-Log "`nMain BCD Configuration:" "Yellow"
+$currentConfig = & cmd /c "bcdedit /enum {current} 2>&1" | Out-String
+Write-Log $currentConfig "Gray"
 
-# Show final configuration
-Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host "VERIFICATION" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
+Write-Log "`nDefault Configuration:" "Yellow"
+$defaultConfig = & cmd /c "bcdedit /enum {default} 2>&1" | Out-String
+Write-Log $defaultConfig "Gray"
 
-Write-Host "`nLegacy BCD Configuration:" -ForegroundColor Yellow
-Write-Host "Current boot configuration:" -ForegroundColor Gray
-& cmd /c "bcdedit /enum {current} | findstr /i `"device osdevice description`""
-
-Write-Host "`nDefault boot configuration:" -ForegroundColor Gray
-& cmd /c "bcdedit /enum {default} | findstr /i `"device osdevice description`""
-
-Write-Host "`nUEFI BCD Configuration (EFI Partition):" -ForegroundColor Yellow
 if (Test-Path "S:\EFI\Microsoft\Boot\BCD") {
-    & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /enum {default} | findstr /i `"device osdevice description`""
-} else {
-    Write-Host "  EFI BCD not found" -ForegroundColor Red
+    Write-Log "`nUEFI BCD Configuration:" "Yellow"
+    $uefiConfig = & cmd /c "bcdedit /store S:\EFI\Microsoft\Boot\BCD /enum 2>&1" | Out-String
+    Write-Log $uefiConfig "Gray"
 }
 
-Write-Host "`nAll Windows Boot Manager entries:" -ForegroundColor Yellow
-& cmd /c "bcdedit /enum firmware | findstr /i `"description`""
+Write-Log "`nFirmware Boot Order:" "Yellow"
+$fwConfig = & cmd /c "bcdedit /enum firmware 2>&1" | Out-String
+Write-Log $fwConfig "Gray"
 
 # Save configuration
-$config = @{
+$configSummary = @{
     Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    ScriptVersion = "v9-Enhanced"
+    BootType = $bootType
     ASRDrive = $asrDrive
-    Version = "v8"
+    ASRDiskSize = $asrWindows.Size
+    ASRDiskNumber = $asrWindows.DiskNumber
+    WindowsInstallationsFound = $windowsInstallations.Count
     Success = $true
 }
-$config | ConvertTo-Json | Out-File "C:\ASRBootConfig.json" -Force
 
-Write-Host "`n========================================" -ForegroundColor Green
-Write-Host "BOOT CONFIGURATION FORCED!" -ForegroundColor Green
-Write-Host "========================================" -ForegroundColor Green
-Write-Host "ASR Windows: ${asrDrive}:\Windows" -ForegroundColor Cyan
+$configSummary | ConvertTo-Json | Out-File "$logDir\ASRBootConfig.json" -Force
+Write-Log "`nConfiguration saved to $logDir\ASRBootConfig.json" "Green"
+
+# Step 10: Final aggressive fix - Direct registry manipulation
+Write-Log "`nStep 10: Applying registry fixes..." "Yellow"
+try {
+    # Load ASR Windows registry hive
+    $hivePath = "${asrDrive}:\Windows\System32\config\SYSTEM"
+    if (Test-Path $hivePath) {
+        Write-Log "  Loading ASR Windows registry..." "Gray"
+        & cmd /c "reg load HKLM\ASR_SYSTEM `"$hivePath`" 2>&1" | Out-Null
+        
+        # Set boot configuration in registry
+        & cmd /c "reg add HKLM\ASR_SYSTEM\Setup /v SystemPartition /t REG_SZ /d `"${asrDrive}:`" /f 2>&1" | Out-Null
+        & cmd /c "reg add HKLM\ASR_SYSTEM\Setup /v OsLoaderPath /t REG_SZ /d `"\Windows\system32\boot`" /f 2>&1" | Out-Null
+        
+        # Unload hive
+        & cmd /c "reg unload HKLM\ASR_SYSTEM 2>&1" | Out-Null
+        Write-Log "  Registry fixes applied" "Green"
+    }
+} catch {
+    Write-Log "  Could not apply registry fixes: $_" "Yellow"
+}
+
+Write-Log "`n========================================" "Green"
+Write-Log "BOOT CONFIGURATION COMPLETE!" "Green"
+Write-Log "========================================" "Green"
+Write-Log "ASR Windows: ${asrDrive}:\Windows" "Cyan"
+Write-Log "Boot Type: $bootType" "Cyan"
+Write-Log "Log saved to: $logFile" "Cyan"
 
 # Handle reboot
 if (-not $NoReboot) {
-    # Detect if running in automation (as SYSTEM or via Run Command)
-    $isAutomated = ($env:USERNAME -eq "SYSTEM") -or ($env:COMPUTERNAME -match "bootproxy")
+    $isAutomated = ($env:USERNAME -eq "SYSTEM") -or ($env:COMPUTERNAME -match "bootproxy") -or (Get-Process -Name "RunCommandExtension" -ErrorAction SilentlyContinue)
     
     if ($isAutomated) {
-        Write-Host "`nAutomated execution detected - rebooting in 10 seconds..." -ForegroundColor Yellow
-        Write-Host "VM will boot into ASR Windows Server after restart" -ForegroundColor Green
+        Write-Log "`nAutomated execution detected - rebooting in 10 seconds..." "Yellow"
+        Write-Log "VM will boot into ASR Production Windows after restart" "Green"
         Start-Sleep -Seconds 10
         Restart-Computer -Force
     } else {
-        Write-Host "`nManual execution - please reboot when ready:" -ForegroundColor Yellow
-        Write-Host "  shutdown /r /t 0" -ForegroundColor Cyan
+        Write-Log "`nManual execution - please reboot when ready:" "Yellow"
+        Write-Log "  Restart-Computer -Force" "Cyan"
     }
 } else {
-    Write-Host "`nReboot skipped (NoReboot parameter specified)" -ForegroundColor Yellow
-    Write-Host "Please reboot manually to apply changes: shutdown /r /t 0" -ForegroundColor Cyan
+    Write-Log "`nReboot skipped (NoReboot parameter specified)" "Yellow"
+    Write-Log "Please reboot manually: Restart-Computer -Force" "Cyan"
 }
