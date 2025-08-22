@@ -264,8 +264,40 @@ function Initialize-Disks {
             }
         }
         
-        if ($disksPrepared -gt 0) {
-            Write-Log "Prepared $disksPrepared disk(s) for configuration" -Level Success
+        # Now assign drive letters to any large NTFS partitions without them
+        Write-Log "Checking for partitions without drive letters..." -Level Info
+        $partitionsFixed = 0
+        
+        $allPartitions = Get-Partition | Where-Object { 
+            $_.Type -eq 'Basic' -and 
+            $_.DriveLetter -eq 0 -and 
+            $_.Size -gt 10GB 
+        }
+        
+        foreach ($partition in $allPartitions) {
+            try {
+                # Find next available drive letter (starting from F:)
+                $usedLetters = (Get-Partition | Where-Object {$_.DriveLetter} | Select-Object -ExpandProperty DriveLetter)
+                $availableLetters = 70..90 | ForEach-Object { [char]$_ } | Where-Object { $_ -notin $usedLetters -and $_ -ne 'C' }
+                
+                if ($availableLetters.Count -gt 0) {
+                    $newLetter = $availableLetters[0]
+                    Set-Partition -InputObject $partition -NewDriveLetter $newLetter
+                    Write-Log "Assigned drive letter $newLetter to Disk $($partition.DiskNumber) Partition $($partition.PartitionNumber) (Size: $([math]::Round($partition.Size/1GB,2)) GB)" -Level Success
+                    $partitionsFixed++
+                    Start-Sleep -Seconds 2  # Give Windows time to recognize the new drive letter
+                }
+            } catch {
+                Write-Log "Failed to assign drive letter to partition: $_" -Level Warning
+            }
+        }
+        
+        if ($partitionsFixed -gt 0) {
+            Write-Log "Assigned drive letters to $partitionsFixed partition(s)" -Level Success
+        }
+        
+        if ($disksPrepared -gt 0 -or $partitionsFixed -gt 0) {
+            Write-Log "Disk preparation complete - prepared $disksPrepared disk(s), fixed $partitionsFixed partition(s)" -Level Success
             Start-Sleep -Seconds 3  # Give disks time to fully initialize
         }
         
@@ -541,13 +573,17 @@ try {
     Write-Log "ASR Windows: Drive $($asrDisk.DriveLetter)" -Level Success
     Write-Log "Boot files configured on EFI partition" -Level Success
     
-    # Handle reboot (don't reboot if we're running from task - let SYSTEM context handle it)
+    # Handle reboot - ONLY auto-reboot when running as SYSTEM from scheduled task
     if ($RunningFromTask) {
         Write-Log "Configuration complete - returning to SYSTEM context for reboot" -Level Info
         # Create success marker
         "Boot configuration completed at $(Get-Date)" | Out-File -FilePath "C:\temp\ASRBootSuccess.txt" -Force
-    } elseif ($ForceReboot -or !$NoReboot) {
-        Write-Log "Initiating system reboot in 10 seconds..." -Level Info
+    } elseif (Test-RunningAsSystem) {
+        # Running as SYSTEM but NOT from task (shouldn't happen with our flow, but be safe)
+        Write-Log "Running as SYSTEM - configuration complete" -Level Info
+        Write-Log "Manual reboot required" -Level Warning
+    } elseif ($ForceReboot) {
+        Write-Log "ForceReboot specified - initiating system reboot in 10 seconds..." -Level Warning
         Write-Log "To cancel reboot, run: shutdown /a" -Level Warning
         
         # Create success marker before reboot
@@ -556,9 +592,19 @@ try {
         shutdown /r /t 10 /f /c "ASR Boot Configuration Complete - Rebooting to apply changes"
         
         Write-Log "Reboot scheduled" -Level Success
+    } elseif (!$NoReboot) {
+        # Interactive session - DO NOT auto-reboot
+        Write-Log "=========================================" -Level Info
+        Write-Log "Configuration complete!" -Level Success
+        Write-Log "Please reboot the system to boot from ASR disk" -Level Warning
+        Write-Log "=========================================" -Level Info
+        
+        Write-Host "`n" -ForegroundColor Yellow
+        Write-Host "IMPORTANT: Reboot required to complete configuration" -ForegroundColor Yellow -BackgroundColor DarkRed
+        Write-Host "Run 'Restart-Computer' when ready" -ForegroundColor Yellow
     } else {
-        Write-Log "Reboot suppressed by NoReboot parameter" -Level Warning
-        Write-Log "Manual reboot required to complete configuration" -Level Warning
+        Write-Log "NoReboot specified - manual reboot required" -Level Warning
+        Write-Log "Configuration complete" -Level Success
     }
     
 } catch {
