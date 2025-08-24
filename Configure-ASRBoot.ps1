@@ -579,7 +579,9 @@ if (-not $NoReboot) {
         Write-Log "`nAutomated execution detected - rebooting in 10 seconds..." "Yellow"
         Write-Log "VM will boot into ASR Windows Server after restart" "Green"
         Start-Sleep -Seconds 10
-        Restart-Computer -Force
+        
+        # Use shutdown command for more reliable restart when running as SYSTEM
+        & shutdown /r /t 0 /f
     } else {
         Write-Log "`nManual execution - please reboot when ready:" "Yellow"
         Write-Log "  Restart-Computer -Force" "Cyan"
