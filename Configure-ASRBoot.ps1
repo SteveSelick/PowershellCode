@@ -43,24 +43,12 @@ Write-Log "Starting ASR Boot Configuration Script v10.1" "Cyan"
 
 # Detect boot type (UEFI vs Legacy)
 Write-Log "`nDetecting boot type..." "Yellow"
-$bootType = "Unknown"
-try {
-    $firmware = Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control" -Name PEFirmwareType -ErrorAction SilentlyContinue
-    if ($firmware.PEFirmwareType -eq 2) {
-        $bootType = "UEFI"
-        Write-Log "  Boot Type: UEFI (Gen2 VM)" "Green"
-    } elseif ($firmware.PEFirmwareType -eq 1) {
-        $bootType = "BIOS"
-        Write-Log "  Boot Type: Legacy BIOS (Gen1 VM)" "Yellow"
-    }
-} catch {
-    Write-Log "  Could not determine boot type, assuming UEFI for Azure" "Yellow"
-    $bootType = "UEFI"
-}
+$bootType = "UEFI"  # Azure Gen2 VMs are ALWAYS UEFI in 2025
+Write-Log "  Boot Type: UEFI (Azure Gen2 VM)" "Green"
 
+# No need to check registry anymore - it's always UEFI
 if ($ForceUEFI) {
-    $bootType = "UEFI"
-    Write-Log "  Forcing UEFI mode (ForceUEFI parameter set)" "Yellow"
+    Write-Log "  ForceUEFI parameter set (redundant - already UEFI)" "Yellow"
 }
 
 # Rename the current C: drive volume label to "BootProxy" for clarity
