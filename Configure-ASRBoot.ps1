@@ -201,11 +201,7 @@ foreach ($disk in $allDisks) {
                 $newLetter = $availableLetters[0]
                 
                 # Use diskpart for reliability
-                $diskpartScript = @"
-select disk $($disk.Number)
-select partition $($partition.PartitionNumber)
-assign letter=$newLetter
-"@
+                $diskpartScript = "select disk $($disk.Number)`r`nselect partition $($partition.PartitionNumber)`r`nassign letter=$newLetter"
                 $diskpartPath = "C:\temp\assign_letter_d$($disk.Number)_p$($partition.PartitionNumber).txt"
                 $diskpartScript | Out-File $diskpartPath -Encoding ASCII -Force
                 
