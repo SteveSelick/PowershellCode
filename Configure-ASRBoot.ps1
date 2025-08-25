@@ -1,6 +1,6 @@
 # Configure-ASRBoot.ps1
 # Script to configure boot to ASR Windows for Azure UEFI VMs
-# Version 11.0 - Simplified back to core working functionality
+# Version 12.0 - Fixed to use boot disk's EFI partition instead of ASR disk's EFI
 
 param(
     [switch]$NoReboot
@@ -12,7 +12,7 @@ param(
 "Computer: $env:COMPUTERNAME" | Out-File C:\temp\configure_asrboot_ran.txt -Append
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "ASR BOOT CONFIGURATION SCRIPT (v11.0)" -ForegroundColor Cyan
+Write-Host "ASR BOOT CONFIGURATION SCRIPT (v12.0)" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 
 # Check if running as admin
@@ -35,7 +35,7 @@ function Write-Log {
     Write-Host $Message -ForegroundColor $Color
 }
 
-Write-Log "Starting ASR Boot Configuration Script v11.0" "Cyan"
+Write-Log "Starting ASR Boot Configuration Script v12.0" "Cyan"
 
 # Azure Gen2 VMs are always UEFI
 $bootType = "UEFI"
@@ -57,6 +57,7 @@ foreach ($disk in $allDisks) {
 Write-Log "`nFinding ASR disk..." "Yellow"
 $asrDisk = $null
 $bootDisk = Get-Disk | Where-Object { $_.IsBoot }
+Write-Log "Boot disk is Disk $($bootDisk.Number)" "Gray"
 
 foreach ($disk in $allDisks) {
     if (-not $disk.IsBoot) {
@@ -126,25 +127,34 @@ if (!$asrDisk) {
 
 Write-Log "`nASR Windows found on drive $asrDrive" "Cyan"
 
-# Find and mount EFI partition from ASR disk
-Write-Log "`nLooking for EFI partition on ASR disk..." "Yellow"
-$efiPartition = Get-Partition -DiskNumber $asrDisk.Number | Where-Object { 
+# CRITICAL FIX: Find and mount EFI partition from BOOT DISK (not ASR disk)
+Write-Log "`n========================================" "Yellow"
+Write-Log "CRITICAL: Looking for EFI partition on BOOT disk (Disk $($bootDisk.Number))..." "Yellow"
+Write-Log "========================================" "Yellow"
+
+$efiPartition = Get-Partition -DiskNumber $bootDisk.Number | Where-Object { 
     $_.GptType -eq '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' 
 }
 
 if (!$efiPartition) {
-    Write-Log "ERROR: No EFI partition found on ASR disk!" "Red"
+    Write-Log "ERROR: No EFI partition found on boot disk!" "Red"
+    Write-Log "Boot disk partitions:" "Red"
+    Get-Partition -DiskNumber $bootDisk.Number | ForEach-Object {
+        Write-Log "  Partition $($_.PartitionNumber): Type=$($_.GptType), Size=$([math]::Round($_.Size/1GB,2))GB" "Gray"
+    }
     exit 1
 }
+
+Write-Log "Found EFI partition on boot disk: Partition $($efiPartition.PartitionNumber)" "Green"
 
 # Mount EFI partition if not already mounted
 $efiDrive = $efiPartition.DriveLetter
 if (!$efiDrive) {
     $efiDrive = "S"
-    Write-Log "Mounting EFI partition as ${efiDrive}:" "Yellow"
+    Write-Log "Mounting BOOT DISK's EFI partition as ${efiDrive}:" "Yellow"
     
     $diskpartScript = @"
-select disk $($efiPartition.DiskNumber)
+select disk $($bootDisk.Number)
 select partition $($efiPartition.PartitionNumber)
 assign letter=$efiDrive
 "@
@@ -154,7 +164,7 @@ assign letter=$efiDrive
     Start-Sleep -Seconds 2
 }
 
-Write-Log "EFI partition mounted as ${efiDrive}:" "Green"
+Write-Log "Boot disk's EFI partition mounted as ${efiDrive}:" "Green"
 
 # Backup current BCD
 Write-Log "`nBacking up current BCD..." "Yellow"
@@ -162,8 +172,11 @@ $backupFile = "C:\temp\BCD_Backup_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
 $null = & cmd /c "bcdedit /export `"$backupFile`"" 2>&1
 Write-Log "BCD backed up to: $backupFile" "Green"
 
-# Create UEFI boot files on ASR disk's EFI partition
-Write-Log "`nCreating UEFI boot files..." "Yellow"
+# Create UEFI boot files on BOOT DISK's EFI partition pointing to ASR Windows
+Write-Log "`n========================================" "Yellow"
+Write-Log "Creating UEFI boot files on BOOT DISK's EFI..." "Yellow"
+Write-Log "========================================" "Yellow"
+Write-Log "This will create boot files on ${efiDrive}: that boot from ${asrDrive}:\Windows" "Cyan"
 Write-Log "Running: bcdboot ${asrDrive}:\Windows /s ${efiDrive}: /f UEFI" "Gray"
 
 $result = & cmd /c "bcdboot ${asrDrive}:\Windows /s ${efiDrive}: /f UEFI" 2>&1 | Out-String
@@ -205,8 +218,9 @@ if (Test-Path "${efiDrive}:\EFI\Microsoft\Boot\BCD") {
 Write-Log "`n========================================" "Cyan"
 Write-Log "CONFIGURATION COMPLETE" "Cyan"
 Write-Log "========================================" "Cyan"
-Write-Log "ASR Windows: ${asrDrive}:\Windows" "Green"
-Write-Log "EFI Partition: ${efiDrive}:" "Green"
+Write-Log "ASR Windows: ${asrDrive}:\Windows (Disk $($asrDisk.Number))" "Green"
+Write-Log "Boot Disk: Disk $($bootDisk.Number)" "Green"
+Write-Log "EFI Partition: ${efiDrive}: (on Boot Disk)" "Green"
 Write-Log "Boot Type: UEFI" "Green"
 
 # Save configuration
@@ -214,8 +228,9 @@ $config = @{
     Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     ASRDrive = $asrDrive
     ASRDiskNumber = $asrDisk.Number
+    BootDiskNumber = $bootDisk.Number
     EFIDrive = $efiDrive
-    Version = "v11.0"
+    Version = "v12.0"
     BootType = "UEFI"
     Success = $true
 }
