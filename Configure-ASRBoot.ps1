@@ -1,6 +1,6 @@
 # Configure-ASRBoot.ps1
 # Script to configure boot to ASR Windows for Azure UEFI VMs
-# Version 12.0 - Fixed to use boot disk's EFI partition instead of ASR disk's EFI
+# Version 13.0 - More aggressive BCD replacement to force ASR boot
 
 param(
     [switch]$NoReboot
@@ -12,7 +12,7 @@ param(
 "Computer: $env:COMPUTERNAME" | Out-File C:\temp\configure_asrboot_ran.txt -Append
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "ASR BOOT CONFIGURATION SCRIPT (v12.0)" -ForegroundColor Cyan
+Write-Host "ASR BOOT CONFIGURATION SCRIPT (v13.0)" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 
 # Check if running as admin
@@ -35,7 +35,7 @@ function Write-Log {
     Write-Host $Message -ForegroundColor $Color
 }
 
-Write-Log "Starting ASR Boot Configuration Script v12.0" "Cyan"
+Write-Log "Starting ASR Boot Configuration Script v13.0" "Cyan"
 
 # Azure Gen2 VMs are always UEFI
 $bootType = "UEFI"
@@ -127,9 +127,9 @@ if (!$asrDisk) {
 
 Write-Log "`nASR Windows found on drive $asrDrive" "Cyan"
 
-# CRITICAL FIX: Find and mount EFI partition from BOOT DISK (not ASR disk)
+# Find and mount EFI partition from BOOT DISK
 Write-Log "`n========================================" "Yellow"
-Write-Log "CRITICAL: Looking for EFI partition on BOOT disk (Disk $($bootDisk.Number))..." "Yellow"
+Write-Log "Looking for EFI partition on BOOT disk (Disk $($bootDisk.Number))..." "Yellow"
 Write-Log "========================================" "Yellow"
 
 $efiPartition = Get-Partition -DiskNumber $bootDisk.Number | Where-Object { 
@@ -138,10 +138,6 @@ $efiPartition = Get-Partition -DiskNumber $bootDisk.Number | Where-Object {
 
 if (!$efiPartition) {
     Write-Log "ERROR: No EFI partition found on boot disk!" "Red"
-    Write-Log "Boot disk partitions:" "Red"
-    Get-Partition -DiskNumber $bootDisk.Number | ForEach-Object {
-        Write-Log "  Partition $($_.PartitionNumber): Type=$($_.GptType), Size=$([math]::Round($_.Size/1GB,2))GB" "Gray"
-    }
     exit 1
 }
 
@@ -172,46 +168,56 @@ $backupFile = "C:\temp\BCD_Backup_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
 $null = & cmd /c "bcdedit /export `"$backupFile`"" 2>&1
 Write-Log "BCD backed up to: $backupFile" "Green"
 
-# Create UEFI boot files on BOOT DISK's EFI partition pointing to ASR Windows
+# AGGRESSIVE APPROACH: Delete existing boot files and create fresh ones
 Write-Log "`n========================================" "Yellow"
-Write-Log "Creating UEFI boot files on BOOT DISK's EFI..." "Yellow"
+Write-Log "AGGRESSIVE BCD REPLACEMENT" "Yellow"
 Write-Log "========================================" "Yellow"
-Write-Log "This will create boot files on ${efiDrive}: that boot from ${asrDrive}:\Windows" "Cyan"
-Write-Log "Running: bcdboot ${asrDrive}:\Windows /s ${efiDrive}: /f UEFI" "Gray"
 
+# Delete the old BCD store completely
+$bcdPath = "${efiDrive}:\EFI\Microsoft\Boot\BCD"
+if (Test-Path $bcdPath) {
+    Write-Log "Deleting existing BCD store at $bcdPath..." "Yellow"
+    Remove-Item $bcdPath -Force -ErrorAction SilentlyContinue
+    Remove-Item "${efiDrive}:\EFI\Microsoft\Boot\BCD.LOG*" -Force -ErrorAction SilentlyContinue
+}
+
+# Create fresh boot files from ASR Windows
+Write-Log "Creating fresh UEFI boot files on ${efiDrive}: from ${asrDrive}:\Windows..." "Yellow"
 $result = & cmd /c "bcdboot ${asrDrive}:\Windows /s ${efiDrive}: /f UEFI" 2>&1 | Out-String
 Write-Log $result
 
 if ($result -match "successfully created") {
     Write-Log "Boot files created successfully!" "Green"
-} else {
-    Write-Log "WARNING: Boot file creation may have failed" "Yellow"
 }
 
-# Update the Windows Boot Manager to use ASR Windows
-Write-Log "`nUpdating Windows Boot Manager..." "Yellow"
+# Force BCD configuration to ONLY boot from ASR Windows
+Write-Log "`nForcing BCD configuration to ASR Windows ONLY..." "Yellow"
+$bcdStore = "${efiDrive}:\EFI\Microsoft\Boot\BCD"
 
-# Make sure the boot manager points to the correct EFI partition
-$null = & cmd /c "bcdedit /set {bootmgr} device partition=${efiDrive}:" 2>&1
-$null = & cmd /c "bcdedit /set {bootmgr} path \EFI\Microsoft\Boot\bootmgfw.efi" 2>&1
-
-# Set default boot entry
-$null = & cmd /c "bcdedit /set {default} device partition=${asrDrive}:" 2>&1
-$null = & cmd /c "bcdedit /set {default} osdevice partition=${asrDrive}:" 2>&1
-$null = & cmd /c "bcdedit /set {default} path \Windows\system32\boot\winload.efi" 2>&1
-$null = & cmd /c "bcdedit /set {default} systemroot \Windows" 2>&1
-$null = & cmd /c "bcdedit /set {default} description `"ASR Windows`"" 2>&1
-
-# Set timeout to 0
-$null = & cmd /c "bcdedit /timeout 0" 2>&1
-
-# If there's a BCD on the EFI partition, update it too
-if (Test-Path "${efiDrive}:\EFI\Microsoft\Boot\BCD") {
-    Write-Log "Updating EFI BCD store..." "Yellow"
-    $null = & cmd /c "bcdedit /store ${efiDrive}:\EFI\Microsoft\Boot\BCD /set {default} device partition=${asrDrive}:" 2>&1
-    $null = & cmd /c "bcdedit /store ${efiDrive}:\EFI\Microsoft\Boot\BCD /set {default} osdevice partition=${asrDrive}:" 2>&1
-    $null = & cmd /c "bcdedit /store ${efiDrive}:\EFI\Microsoft\Boot\BCD /set {default} path \Windows\system32\boot\winload.efi" 2>&1
-    $null = & cmd /c "bcdedit /store ${efiDrive}:\EFI\Microsoft\Boot\BCD /set {default} systemroot \Windows" 2>&1
+if (Test-Path $bcdStore) {
+    # Delete ALL existing OS loader entries except {default}
+    Write-Log "Cleaning up existing boot entries..." "Yellow"
+    $entries = & bcdedit /store $bcdStore /enum osloader 2>&1 | Out-String
+    $guids = [regex]::Matches($entries, '{[\w-]+}') | ForEach-Object { $_.Value } | Where-Object { $_ -ne '{default}' -and $_ -ne '{bootmgr}' }
+    
+    foreach ($guid in $guids) {
+        Write-Log "Deleting boot entry: $guid" "Gray"
+        $null = & bcdedit /store $bcdStore /delete $guid /f 2>&1
+    }
+    
+    # Set all the properties for {default}
+    $null = & bcdedit /store $bcdStore /set {default} device partition=${asrDrive}: 2>&1
+    $null = & bcdedit /store $bcdStore /set {default} osdevice partition=${asrDrive}: 2>&1
+    $null = & bcdedit /store $bcdStore /set {default} path \Windows\system32\boot\winload.efi 2>&1
+    $null = & bcdedit /store $bcdStore /set {default} systemroot \Windows 2>&1
+    $null = & bcdedit /store $bcdStore /set {default} description "ASR Windows" 2>&1
+    
+    # Set boot manager settings
+    $null = & bcdedit /store $bcdStore /set {bootmgr} default {default} 2>&1
+    $null = & bcdedit /store $bcdStore /timeout 0 2>&1
+    $null = & bcdedit /store $bcdStore /set {bootmgr} displaybootmenu No 2>&1
+    
+    Write-Log "BCD store configuration completed" "Green"
 }
 
 # Show final configuration
@@ -221,7 +227,6 @@ Write-Log "========================================" "Cyan"
 Write-Log "ASR Windows: ${asrDrive}:\Windows (Disk $($asrDisk.Number))" "Green"
 Write-Log "Boot Disk: Disk $($bootDisk.Number)" "Green"
 Write-Log "EFI Partition: ${efiDrive}: (on Boot Disk)" "Green"
-Write-Log "Boot Type: UEFI" "Green"
 
 # Save configuration
 $config = @{
@@ -230,7 +235,7 @@ $config = @{
     ASRDiskNumber = $asrDisk.Number
     BootDiskNumber = $bootDisk.Number
     EFIDrive = $efiDrive
-    Version = "v12.0"
+    Version = "v13.0"
     BootType = "UEFI"
     Success = $true
 }
