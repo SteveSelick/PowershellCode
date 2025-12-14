@@ -24,26 +24,49 @@ Write-Host "Granting read access to source profile..." -ForegroundColor Yellow
 $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 icacls $sourceProfile /grant "${currentUser}:(OI)(CI)RX" /T /C /Q 2>$null
 
-# Folders to exclude (temp, caches, app packages - NOT legacy junction names)
-$excludeDirs = @(
-    'AppData\Local\Temp'
-    'AppData\Local\Microsoft\Windows\INetCache'
-    'AppData\Local\Microsoft\Windows\WebCache'
-    'AppData\Local\Microsoft\Windows\Explorer'
-    'AppData\Local\Microsoft\Windows\Caches'
-    'AppData\Local\Microsoft\Windows\WER'
-    'AppData\Local\Microsoft\WindowsApps'
-    'AppData\Local\Packages'
-    'AppData\Local\CrashDumps'
-    'AppData\Local\D3DSCache'
-    'AppData\Local\PeerDistRepub'
-    'AppData\Local\ConnectedDevicesPlatform'
-    'AppData\LocalLow\Microsoft'
-    'MicrosoftEdgeBackups'
-    'IntelGraphicsProfiles'
+# Folder names to exclude anywhere in tree (caches, temp, junk)
+$excludeDirNames = @(
+    'Cache'
+    'Caches'
+    'CacheStorage'
+    'CachedData'
+    'CachedExtensions'
+    'CachedExtensionVSIXs'
+    'Code Cache'
+    'GPUCache'
+    'ShaderCache'
+    'D3DSCache'
+    'Temp'
+    'Tmp'
+    'Logs'
+    'CrashDumps'
+    'WebCache'
+    'INetCache'
+    'IconCache'
+    'thumbnails'
+    'Crash Reports'
+    'ElevatedDiagnostics'
+    'PerfLogs'
+    '$Recycle.Bin'
+    '$RECYCLE.BIN'
+    'Recycle'
+    'Recycler'
 )
 
-# Files to exclude (registry hives, lock files)
+# Full paths to exclude
+$excludeDirPaths = @(
+    "$sourceProfile\AppData\Local\Microsoft\Windows\Explorer"
+    "$sourceProfile\AppData\Local\Microsoft\Windows\WER"
+    "$sourceProfile\AppData\Local\Microsoft\WindowsApps"
+    "$sourceProfile\AppData\Local\Packages"
+    "$sourceProfile\AppData\Local\PeerDistRepub"
+    "$sourceProfile\AppData\Local\ConnectedDevicesPlatform"
+    "$sourceProfile\AppData\LocalLow\Microsoft"
+    "$sourceProfile\MicrosoftEdgeBackups"
+    "$sourceProfile\IntelGraphicsProfiles"
+)
+
+# Files to exclude (registry hives, lock files, temp files)
 $excludeFiles = @(
     'NTUSER.DAT'
     'NTUSER.DAT.LOG*'
@@ -53,14 +76,17 @@ $excludeFiles = @(
     'UsrClass.dat'
     'UsrClass.dat.LOG*'
     '*.tmp'
+    '*.temp'
     '*.lock'
+    '*.log'
     'desktop.ini'
     'Thumbs.db'
     'IconCache.db'
+    '*.etl'
 )
 
 # Build robocopy exclude arguments
-$xdArgs = ($excludeDirs | ForEach-Object { "`"$sourceProfile\$_`"" }) -join ' '
+$xdArgs = (($excludeDirNames | ForEach-Object { "`"$_`"" }) + ($excludeDirPaths | ForEach-Object { "`"$_`"" })) -join ' '
 $xfArgs = ($excludeFiles | ForEach-Object { "`"$_`"" }) -join ' '
 
 # Run robocopy
